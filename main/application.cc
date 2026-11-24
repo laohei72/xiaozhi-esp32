@@ -1204,6 +1204,18 @@ void Application::ConfigureWakeWordForListening() {
 #endif
 }
 
+void Application::StartNotifyPlayerTest() {
+    Schedule([this]() {
+        if (GetDeviceState() != kDeviceStateIdle) {
+            ESP_LOGW(TAG, "Notify player test ignored: device is not idle");
+            return;
+        }
+        StartNotification(
+            "https://raw.githubusercontent.com/laohei72/xiaozhi-esp32/4de00aed740595a8713b01f8332b9b2cf30685bc/main/assets/locales/zh-CN/welcome.ogg",
+            std::vector<NotifySubtitle>());
+    });
+}
+
 void Application::StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles) {
     if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy()) {
         ESP_LOGW(TAG, "Ignoring notify message while device is busy");
