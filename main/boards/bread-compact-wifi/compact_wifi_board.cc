@@ -34,9 +34,7 @@ private:
     Button volume_down_button_;
     esp_timer_handle_t pir_poll_timer_ = nullptr;
     int pir_last_level_ = 0;
-    int64_t pir_high_since_us_ = 0;
     int64_t pir_last_trigger_us_ = 0;
-    bool pir_high_triggered_ = false;
 
     void InitializePirSensor() {
         gpio_config_t config = {};
@@ -47,38 +45,20 @@ private:
         config.intr_type = GPIO_INTR_DISABLE;
         ESP_ERROR_CHECK(gpio_config(&config));
         pir_last_level_ = gpio_get_level(PIR_SENSOR_GPIO);
-        if (pir_last_level_ != 0) {
-            // Ignore a PIR output that is already high during sensor warm-up.
-            pir_high_since_us_ = esp_timer_get_time();
-            pir_high_triggered_ = true;
-        }
 
         esp_timer_create_args_t timer_args = {
             .callback = [](void* arg) {
                 auto* board = static_cast<CompactWifiBoard*>(arg);
                 const int level = gpio_get_level(PIR_SENSOR_GPIO);
-                const int64_t now = esp_timer_get_time();
-                constexpr int64_t kPirStableHighUs = 2500LL * 1000;
-                constexpr int64_t kPirCooldownUs = 20LL * 1000 * 1000;
-
-                if (level != 0) {
-                    if (board->pir_last_level_ == 0) {
-                        board->pir_high_since_us_ = now;
-                        board->pir_high_triggered_ = false;
+                if (level != 0 && board->pir_last_level_ == 0) {
+                    const int64_t now = esp_timer_get_time();
+                    constexpr int64_t kPirCooldownUs = 20LL * 1000 * 1000;
+                    if (board->pir_last_trigger_us_ == 0 ||
+                        now - board->pir_last_trigger_us_ >= kPirCooldownUs) {
+                        board->pir_last_trigger_us_ = now;
+                        ESP_LOGI(TAG, "PIR motion detected");
+                        Application::GetInstance().StartProactiveGreeting();
                     }
-                    if (!board->pir_high_triggered_ && board->pir_high_since_us_ != 0 &&
-                        now - board->pir_high_since_us_ >= kPirStableHighUs) {
-                        board->pir_high_triggered_ = true;
-                        if (board->pir_last_trigger_us_ == 0 ||
-                            now - board->pir_last_trigger_us_ >= kPirCooldownUs) {
-                            board->pir_last_trigger_us_ = now;
-                            ESP_LOGI(TAG, "PIR motion detected (stable high)");
-                            Application::GetInstance().StartProactiveGreeting();
-                        }
-                    }
-                } else {
-                    board->pir_high_since_us_ = 0;
-                    board->pir_high_triggered_ = false;
                 }
                 board->pir_last_level_ = level;
             },

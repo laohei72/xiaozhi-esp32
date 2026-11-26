@@ -328,7 +328,20 @@ void Application::Run() {
                 !pcm_tts_player_.IsBusy()) {
                 ReminderTask task = std::move(pending_reminder_task_);
                 reminder_chime_pending_ = false;
-                StartReminderPlayback(task);
+                // The user may cancel or reschedule the task while the chime is playing.
+                bool still_due = false;
+                for (const auto& current : reminder_manager_.ListReminders()) {
+                    if (current.id == task.id && current.state == ReminderState::kDue) {
+                        task = current;
+                        still_due = true;
+                        break;
+                    }
+                }
+                if (still_due) {
+                    StartReminderPlayback(task);
+                } else if (GetDeviceState() == kDeviceStateSpeaking) {
+                    SetDeviceState(kDeviceStateIdle);
+                }
             }
         }
 
