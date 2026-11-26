@@ -23,6 +23,7 @@
 #include "notify/notify_player.h"
 #include "reminder/baidu_tts_source.h"
 #include "reminder/pcm_tts_player.h"
+#include "reminder/reminder_manager.h"
 
 // Main event bits
 #define MAIN_EVENT_SCHEDULE             (1 << 0)
@@ -125,6 +126,9 @@ public:
     void StartNotifyPlayerTest();
     void StartPcmTtsTest();
     AudioService& GetAudioService() { return audio_service_; }
+    // Reminder tasks (main/reminder/reminder_manager.*). Thread-safe, so the MCP tools call it
+    // from wherever they run; the utterances are started by the main task only.
+    ReminderManager& GetReminderManager() { return reminder_manager_; }
     
     /**
      * Reset protocol resources (thread-safe)
@@ -150,6 +154,9 @@ private:
     std::string startup_wake_word_hint_message_;
     AudioService audio_service_;
     NotifyPlayer notify_player_;
+    // Reminder tasks. The clock tick settles them and starts their utterance through the PCM
+    // player below.
+    ReminderManager reminder_manager_;
     // Baidu TTS transport of the PCM utterances. Declared before the player so it outlives the
     // player's worker task, which owns every Http call of a session.
     BaiduTtsSource baidu_tts_source_;
@@ -157,6 +164,12 @@ private:
     uint32_t notification_playback_id_ = 0;
     // Session id of the PCM TTS utterance the UI is currently showing; 0 when none is active.
     uint32_t pcm_tts_session_id_ = 0;
+    // Reminder the active PCM utterance speaks, 0 when the session is the self test. The player's
+    // result is fed back to the manager with this id when the session ends.
+    uint32_t pcm_tts_reminder_id_ = 0;
+    // Monotonic deadline (ms) before which a reminder whose utterance failed or was interrupted is
+    // not retried, so a barge-in does not replay the task on the very next tick.
+    uint64_t reminder_retry_not_before_ms_ = 0;
     // Server Opus frames dropped while a PCM session owned the playback path (§9.5).
     std::atomic<uint32_t> pcm_tts_dropped_packets_{0};
     std::unique_ptr<Ota> ota_;
@@ -202,6 +215,10 @@ private:
     bool StopPcmTts(const char* reason);
     // Runs on the player's worker task: only schedules work for the main task.
     void HandlePcmTtsFinished(uint32_t session_id, PcmTtsPlayer::Error error);
+    // Clock tick: settles due reminders and starts the next utterance when the device is idle.
+    void HandleReminderTick();
+    // Starts the PCM utterance that speaks |task|; returns false when it could not be started.
+    bool StartReminderPlayback(const ReminderTask& task);
 
     // Activation task (runs in background)
     void ActivationTask();

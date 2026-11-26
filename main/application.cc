@@ -8,6 +8,7 @@
 #include "http.h"
 #include "mcp_server.h"
 #include "mqtt_protocol.h"
+#include "reminder/reminder_tools.h"
 #include "settings.h"
 #include "system_info.h"
 #include "text_glyph_payload.h"
@@ -18,6 +19,7 @@
 #include <arpa/inet.h>
 #include <cJSON.h>
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -52,6 +54,34 @@ std::unique_ptr<Http> CreateBaiduTtsHttp() {
         return nullptr;
     }
     return network->CreateHttp(0);
+}
+
+// A reminder whose utterance failed or was interrupted is offered again on a later tick instead of
+// the next one: the usual cause is a barge-in, and replaying it immediately would talk over the
+// user.
+constexpr uint64_t kReminderRetryDelayMs = 30 * 1000;
+
+// Reminder schedule fields are local time, while the firmware clock is UTC until a zone is set (the
+// time itself comes from the OTA server, there is no SNTP client). The zone therefore comes from
+// the same out-of-band "reminder" NVS namespace as the TTS credentials: tz holds a POSIX TZ string,
+// "CST-8" (UTC+8) when unset. This also fixes the clock on the status bar.
+void ApplyReminderTimeZone() {
+    Settings settings("reminder", false);
+    const std::string tz = settings.GetString("tz", "CST-8");
+    if (tz.empty()) {
+        return;
+    }
+    if (setenv("TZ", tz.c_str(), 1) != 0) {
+        ESP_LOGW(TAG, "Failed to apply the reminder time zone %s", tz.c_str());
+        return;
+    }
+    tzset();
+    ESP_LOGI(TAG, "Reminder time zone: %s", tz.c_str());
+}
+
+// esp_timer_get_time() in ms, the base every relative reminder deadline uses.
+uint64_t NowMonotonicMs() {
+    return static_cast<uint64_t>(esp_timer_get_time()) / 1000;
 }
 
 }  // namespace
@@ -105,6 +135,13 @@ void Application::Initialize() {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
 
+    // The time zone has to be applied before the reminders are restored: the next daily/weekly
+    // occurrence is computed from local time.
+    ApplyReminderTimeZone();
+    // Restore the stored reminders before the first clock tick can play one, so a task that expired
+    // while the device was off is settled exactly once, at boot.
+    reminder_manager_.Init();
+
     // Setup the display
     auto display = board.GetDisplay();
     display->SetupUI();
@@ -157,6 +194,9 @@ void Application::Initialize() {
     auto& mcp_server = McpServer::GetInstance();
     mcp_server.AddCommonTools();
     mcp_server.AddUserOnlyTools();
+    // The reminder feature keeps its tools in its own translation unit; the manager is a member, so
+    // both transports reach the same task list.
+    RegisterReminderTools(reminder_manager_);
     // Registration is complete here, so this is the only place the whole inventory exists.
     // It is logged because a server that accepts a bounded number of tools drops the rest
     // quietly: the only sign on this device was an alert at boot and a sad face, which is
@@ -338,6 +378,10 @@ void Application::Run() {
             clock_ticks_++;
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
+
+            // Reminders: settle the tasks that are due and speak the next one when the device is
+            // idle.
+            HandleReminderTick();
 
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
@@ -1422,6 +1466,8 @@ bool Application::StartPcmTtsSession(const char* source, int sample_rate, int ch
     }
 
     pcm_tts_session_id_ = session_id;
+    // Cleared by default: only a reminder sets it, so the self test never feeds a task.
+    pcm_tts_reminder_id_ = 0;
     pcm_tts_dropped_packets_.store(0);
     board.GetDisplay()->SetChatMessage("assistant", "");
     ESP_LOGI(TAG, "PCM TTS (%s) session %lu started: %d Hz / %d channel", source,
@@ -1451,6 +1497,59 @@ bool Application::StopPcmTts(const char* reason) {
     return true;
 }
 
+void Application::HandleReminderTick() {
+    // Settle first: a task whose trigger time passed while the device was busy becomes due here,
+    // and a recurring task is re-armed by OnPlaybackFinished() once it played.
+    reminder_manager_.MarkDueTasks();
+
+    // Never talk over a conversation, a notification or another utterance. The task stays due, so
+    // nothing is lost by skipping it here.
+    if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy() ||
+        pcm_tts_player_.IsBusy()) {
+        return;
+    }
+    if (NowMonotonicMs() < reminder_retry_not_before_ms_) {
+        return;
+    }
+
+    ReminderTask task;
+    if (!reminder_manager_.TakeNextDueTask(task)) {
+        return;
+    }
+    StartReminderPlayback(task);
+}
+
+bool Application::StartReminderPlayback(const ReminderTask& task) {
+    const uint32_t id = task.id;
+    const std::string text = task.text;
+    ESP_LOGI(TAG, "Speaking reminder %lu", static_cast<unsigned long>(id));
+
+    // Claim the task before any I/O: TakeNextDueTask() is read-only, so this is what keeps the next
+    // tick from starting the same task again while the worker is still fetching the credentials.
+    reminder_manager_.MarkPlaying(id);
+
+    // The source opens itself on the player's worker task (§9.1), so the token request and the HTTP
+    // round trip never block the main event loop.
+    PcmTtsPlayer::ChunkReader reader = [this](std::vector<uint8_t>& chunk) {
+        return baidu_tts_source_.Read(chunk);
+    };
+    PcmTtsPlayer::PrepareCallback prepare = [this, text]() { return baidu_tts_source_.Open(text); };
+    PcmTtsPlayer::CloseCallback close = [this]() { baidu_tts_source_.Close(); };
+    if (!StartPcmTtsSession("reminder", kBaiduTtsSampleRate, kBaiduTtsChannels, std::move(reader),
+                            std::move(prepare), std::move(close))) {
+        // Nothing was started, so hand the task back: it stays due and is retried on a later tick
+        // instead of being dropped.
+        reminder_manager_.MarkPlaybackFailed(id);
+        reminder_retry_not_before_ms_ = NowMonotonicMs() + kReminderRetryDelayMs;
+        ESP_LOGW(TAG, "Failed to start reminder %lu playback", static_cast<unsigned long>(id));
+        return false;
+    }
+
+    pcm_tts_reminder_id_ = id;
+    Board::GetInstance().GetDisplay()->SetChatMessage("assistant", text.c_str());
+    return true;
+}
+
 void Application::HandlePcmTtsFinished(uint32_t session_id, PcmTtsPlayer::Error error) {
     // Worker-task context: hop to the main task before touching state, display or power save.
     Schedule([this, session_id, error]() {
@@ -1460,6 +1559,9 @@ void Application::HandlePcmTtsFinished(uint32_t session_id, PcmTtsPlayer::Error 
             return;
         }
         pcm_tts_session_id_ = 0;
+        // The reminder this utterance speaks, 0 for the self test.
+        const uint32_t reminder_id = pcm_tts_reminder_id_;
+        pcm_tts_reminder_id_ = 0;
         const uint32_t dropped = pcm_tts_dropped_packets_.exchange(0);
         if (dropped > 0) {
             ESP_LOGW(TAG, "Dropped %lu server audio packets during PCM TTS playback",
@@ -1471,6 +1573,14 @@ void Application::HandlePcmTtsFinished(uint32_t session_id, PcmTtsPlayer::Error 
             // kCancelled is the normal outcome of a user interrupt, so it is not an error.
             ESP_LOGW(TAG, "PCM TTS session %lu finished with %s",
                      static_cast<unsigned long>(session_id), PcmTtsPlayer::GetErrorName(error));
+        }
+        if (reminder_id != 0) {
+            // Only kSuccess completes or reschedules the task; anything else keeps it retryable, and
+            // the gate below delays that retry so a barge-in does not replay the task immediately.
+            reminder_manager_.OnPlaybackFinished(reminder_id, error);
+            if (error != PcmTtsPlayer::Error::kSuccess) {
+                reminder_retry_not_before_ms_ = NowMonotonicMs() + kReminderRetryDelayMs;
+            }
         }
         Board::GetInstance().GetDisplay()->SetChatMessage("assistant", "");
         if (GetDeviceState() == kDeviceStateSpeaking) {
