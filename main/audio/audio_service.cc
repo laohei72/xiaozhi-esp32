@@ -1,5 +1,6 @@
 #include "audio_service.h"
 #include <esp_log.h>
+#include <algorithm>
 #include <cstring>
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)                                        \
@@ -25,7 +26,11 @@
 
 #define TAG "AudioService"
 
-AudioService::AudioService() { event_group_ = xEventGroupCreate(); }
+AudioService::AudioService() {
+    event_group_ = xEventGroupCreate();
+    // Bounded byte staging: never grows beyond one full PCM frame (§7.1).
+    pcm_pending_bytes_.reserve(PCM_PLAYBACK_CHUNK_BYTES);
+}
 
 AudioService::~AudioService() {
     if (event_group_ != nullptr) {
@@ -819,6 +824,292 @@ void AudioService::ResetDecoder() {
     if (notify_drained && callbacks_.on_playback_drained) {
         callbacks_.on_playback_drained();
     }
+}
+
+bool AudioService::BeginPcmPlayback(int input_sample_rate, int input_channels,
+                                    uint32_t playback_id) {
+    // 24 kHz pass-through only: no implicit resampling (§3.1).
+    const int output_sample_rate = (codec_ != nullptr) ? codec_->output_sample_rate() : 0;
+    if (codec_ == nullptr || input_sample_rate != output_sample_rate || input_channels != 1) {
+        ESP_LOGE(TAG, "Unsupported PCM format: %d Hz / %d channels (need %d Hz / mono)",
+                 input_sample_rate, input_channels, output_sample_rate);
+        return false;
+    }
+
+    // Repeated BeginPcmPlayback() does not nest sessions: cancel the previous one first
+    // (§3.3). AbortPcmPlayback() takes pcm_mutex_ itself, so it must run before we lock it.
+    AbortPcmPlayback();
+
+    // Power on the output ahead of the first frame (§6.5), mirroring PlaySound(): the amplifier
+    // is already live when AudioOutputTask() writes frame 0, so the start of the utterance is
+    // not swallowed. The periodic power check is re-armed first because
+    // CheckAndUpdateAudioPowerState() stops the timer once both input and output are off; it
+    // turns the output off again after AUDIO_POWER_TIMEOUT_MS without output, exactly like the
+    // Opus path. Both AudioCodec::EnableOutput() (audio_codec.cc) and every board override
+    // return early on a repeated same-value call, and AudioOutputTask() keeps its own fallback,
+    // so this never double-triggers. Done outside the locks: opening the PA/I2S TX is slow and
+    // must not extend a critical section shared with the audio output task.
+    if (!codec_->output_enabled()) {
+        esp_timer_stop(audio_power_timer_);
+        esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
+        codec_->EnableOutput(true);
+    }
+
+    std::lock_guard<std::mutex> pcm_lock(pcm_mutex_);
+    std::lock_guard<std::mutex> queue_lock(audio_queue_mutex_);
+
+    // Fixed cancellation tokens for this session (§6.2.1). playback_generation_ is a plain
+    // uint32_t protected by audio_queue_mutex_, hence read under that lock;
+    // pcm_stream_generation_ is atomic and only AbortPcmPlayback() increments it.
+    pcm_session_pcm_gen_ = pcm_stream_generation_.load();
+    pcm_session_playback_gen_ = playback_generation_;
+
+    pcm_stream_active_ = true;
+    pcm_playback_id_ = playback_id;
+    pcm_media_position_ms_ = 0;
+    pcm_pending_bytes_.clear();
+
+    ESP_LOGI(TAG, "PCM playback started: %d Hz / %d channel, playback id %u", input_sample_rate,
+             input_channels, (unsigned)playback_id);
+    return true;
+}
+
+bool AudioService::WritePcmData(const uint8_t* data, size_t size, bool last) {
+    if (service_stopped_.load()) {
+        return false;
+    }
+    if (data == nullptr && size != 0) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(pcm_mutex_);
+    // Order matters: check active before handling the empty block, otherwise an empty
+    // non-final write would return true without a session (§3.3).
+    if (!pcm_stream_active_) {
+        ESP_LOGW(TAG, "PCM playback is not active, dropping %u bytes", (unsigned)size);
+        return false;
+    }
+    // Fixed session tokens: never re-loaded or replaced here, never compared with each other.
+    // Snapshotted before the empty-chunk paths so those paths can run the same recheck: an
+    // empty chunk never reaches the authoritative check inside the playback queue.
+    const uint32_t pcm_gen = pcm_session_pcm_gen_;
+    const uint32_t playback_gen = pcm_session_playback_gen_;
+
+    bool framed = false;  // did this call reach the authoritative cancel check via a frame?
+    size_t offset = 0;
+    while (offset < size) {
+        const size_t room = PCM_PLAYBACK_CHUNK_BYTES - pcm_pending_bytes_.size();
+        const size_t take = std::min(room, size - offset);
+        pcm_pending_bytes_.insert(pcm_pending_bytes_.end(), data + offset, data + offset + take);
+        offset += take;
+
+        if (pcm_pending_bytes_.size() == PCM_PLAYBACK_CHUNK_BYTES) {
+            if (!FlushPcmPendingBytes(false, pcm_gen, playback_gen)) {
+                return false;
+            }
+            framed = true;
+        }
+    }
+
+    // A final flush publishes the tail frame only when at least one complete sample is staged;
+    // otherwise FlushPcmPendingBytes() enqueues nothing and returns true without any generation
+    // check, so such a call has to pass the recheck below first (§7.2).
+    if (last && pcm_pending_bytes_.size() >= sizeof(int16_t)) {
+        // Tail frame: push every complete sample (may be < 1440 samples); a lone trailing
+        // byte is discarded with a warning by FlushPcmPendingBytes(). The flush runs the
+        // authoritative check inside PushPcmTaskToPlaybackQueue()'s critical section.
+        return FlushPcmPendingBytes(true, pcm_gen, playback_gen);
+    }
+
+    // Short-block / empty-chunk recheck: nothing went through the authoritative cancellation
+    // check inside PushPcmTaskToPlaybackQueue(). Compare the fixed session tokens once under a
+    // brief, non-waiting audio_queue_mutex_ acquire (lock order stays pcm_mutex_ ->
+    // audio_queue_mutex_), so a cancelled session stops the HTTP reader immediately.
+    if (!framed) {
+        std::lock_guard<std::mutex> queue_lock(audio_queue_mutex_);
+        if (service_stopped_.load()) {
+            return false;
+        }
+        if (pcm_gen != pcm_stream_generation_.load()) {
+            return false;
+        }
+        if (playback_gen != playback_generation_) {
+            return false;
+        }
+    }
+
+    if (last) {
+        // Reached only when no tail frame will be published (less than one sample staged, or
+        // the frames of this call were already pushed): the flush just drops a lone trailing
+        // byte with a warning and cannot enqueue anything.
+        return FlushPcmPendingBytes(true, pcm_gen, playback_gen);
+    }
+    return true;
+}
+
+bool AudioService::EndPcmPlayback(uint32_t timeout_ms) {
+    uint32_t pcm_gen = 0;
+    uint32_t playback_gen = 0;
+    bool flush_ok = true;
+    {
+        std::lock_guard<std::mutex> lock(pcm_mutex_);
+
+        // No session: report whether the playback path is idle and change nothing (§9.1).
+        if (!pcm_stream_active_) {
+            return IsPlaybackIdle();
+        }
+
+        // Fixed tokens of this session: the drain wait identifies cancellation with them and
+        // never replaces them with a freshly loaded generation (§6.2.1).
+        pcm_gen = pcm_session_pcm_gen_;
+        playback_gen = pcm_session_playback_gen_;
+
+        // Tail frame (possibly < 1440 samples) goes through the same tokens as WritePcmData().
+        flush_ok = FlushPcmPendingBytes(true, pcm_gen, playback_gen);
+
+        // Close the writable flag on every path, before releasing pcm_mutex_, so a cancelled
+        // session can never stay "active" while its tokens are stale (§9.1, §9.4).
+        pcm_stream_active_ = false;
+    }
+    if (!flush_ok) {
+        // The tail push already saw a stale token (Abort/Stop/ResetDecoder): do not wait.
+        return false;
+    }
+
+    // Drain wait: holds audio_queue_mutex_ only. pcm_stream_generation_ is read atomically, so
+    // the lock order pcm_mutex_ -> audio_queue_mutex_ is never reversed and AbortPcmPlayback()
+    // (bump, notify, then take pcm_mutex_) cannot deadlock against this wait (§6.3, §9.1).
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    audio_queue_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&]() {
+        return service_stopped_.load() ||                   // service stopped
+               pcm_gen != pcm_stream_generation_.load() ||  // AbortPcmPlayback()
+               playback_gen != playback_generation_ ||      // Stop()/ResetDecoder()
+               IsPlaybackDrainedLocked();                   // normal drain
+    });
+
+    // Cancellation wins over drain, drain wins over timeout; all three are read inside this one
+    // critical section, consistent with the predicate (§9.1).
+    if (service_stopped_.load()) {
+        return false;
+    }
+    if (pcm_gen != pcm_stream_generation_.load()) {
+        return false;
+    }
+    if (playback_gen != playback_generation_) {
+        return false;
+    }
+
+    const bool drained = IsPlaybackDrainedLocked();
+    if (!drained) {
+        // Timeout path: the queue is left untouched so already queued PCM keeps playing.
+        ESP_LOGW(TAG, "PCM playback drain timed out after %u ms", (unsigned)timeout_ms);
+    }
+    return drained;
+}
+
+void AudioService::AbortPcmPlayback() {
+    // ① Bump the active PCM generation without taking any lock, so a writer blocked on
+    //    audio_queue_cv_ (while holding pcm_mutex_) observes the mismatch once woken (§6.3).
+    pcm_stream_generation_.fetch_add(1);
+    // ② Wake blocked writers (shared cv; other waiters simply re-evaluate their predicate).
+    audio_queue_cv_.notify_all();
+
+    // ③ Only now take pcm_mutex_; never touches playback_generation_ nor the queues (§6.3).
+    std::lock_guard<std::mutex> pcm_lock(pcm_mutex_);
+    pcm_pending_bytes_.clear();
+    pcm_stream_active_ = false;
+}
+
+bool AudioService::IsPcmPlaybackActive() const {
+    // Only reflects the writable flag, not the validity of the two session tokens (§3.1).
+    return pcm_stream_active_;
+}
+
+bool AudioService::PushPcmTaskToPlaybackQueue(std::vector<int16_t>&& pcm, uint32_t pcm_generation,
+                                              uint32_t playback_generation) {
+    // Caller (FlushPcmPendingBytes) must already hold pcm_mutex_.
+    AudioTask task;
+    task.type = kAudioTaskTypeDecodeToPlaybackQueue;
+    task.pcm = std::move(pcm);
+    task.playback_id = pcm_playback_id_;
+    // Media position is the value before this frame; FlushPcmPendingBytes() advances it only
+    // after a successful push (§6.2.3).
+    task.media_position_ms = pcm_media_position_ms_;
+
+    // Parameters differ from their members only by the trailing underscore; alias them so the
+    // two independent comparisons below cannot be misread (§6.2.2 note 3).
+    const uint32_t pcm_gen = pcm_generation;
+    const uint32_t playback_gen = playback_generation;
+
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+
+    // The predicate only wakes us up: room in the queue, or either token invalid, or stopped.
+    audio_queue_cv_.wait(lock, [&]() {
+        return service_stopped_.load() || pcm_gen != pcm_stream_generation_.load() ||
+               playback_gen != playback_generation_ ||
+               audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE;
+    });
+
+    // Final check in the same critical section as push_back. playback_generation_ is protected
+    // by this same mutex (no window); pcm_stream_generation_ can still be bumped by
+    // AbortPcmPlayback() without it (accepted soft-cancel window, §6.4.1/§6.4.2).
+    if (service_stopped_.load()) {
+        return false;
+    }
+    if (pcm_gen != pcm_stream_generation_.load()) {
+        return false;
+    }
+    if (playback_gen != playback_generation_) {
+        return false;
+    }
+
+    playback_drained_notified_ = false;  // so on_playback_drained() can fire again
+    if (!audio_playback_queue_.push_back(std::move(task))) {
+        ESP_LOGE(TAG, "Failed to push PCM task: playback queue is full");
+        return false;
+    }
+    audio_queue_cv_.notify_all();
+    return true;
+}
+
+bool AudioService::FlushPcmPendingBytes(bool is_final, uint32_t pcm_generation,
+                                        uint32_t playback_generation) {
+    // Caller must hold pcm_mutex_. Both tokens are passed through untouched: this function
+    // never reads pcm_stream_generation_ or playback_generation_ (§7.3).
+    for (;;) {
+        if (pcm_pending_bytes_.size() < sizeof(int16_t)) {
+            break;
+        }
+        size_t byte_count =
+            pcm_pending_bytes_.size() - (pcm_pending_bytes_.size() % sizeof(int16_t));
+        if (byte_count > PCM_PLAYBACK_CHUNK_BYTES) {
+            byte_count = PCM_PLAYBACK_CHUNK_BYTES;
+        }
+        // Non-final flush pushes full frames only; the final flush also pushes the remainder.
+        if (!is_final && byte_count < PCM_PLAYBACK_CHUNK_BYTES) {
+            break;
+        }
+
+        const uint32_t frame_samples = (uint32_t)(byte_count / sizeof(int16_t));
+        std::vector<int16_t> frame(frame_samples);
+        std::memcpy(frame.data(), pcm_pending_bytes_.data(), byte_count);
+        pcm_pending_bytes_.erase(pcm_pending_bytes_.begin(),
+                                 pcm_pending_bytes_.begin() + byte_count);
+
+        if (!PushPcmTaskToPlaybackQueue(std::move(frame), pcm_generation, playback_generation)) {
+            return false;  // cancelled/stopped: do not advance the media position
+        }
+        // Advance only after a successful enqueue; integer milliseconds, rounded down.
+        // 1440 samples -> 60 ms; the tail frame -> its real duration. 24000 is the output
+        // sample rate validated by BeginPcmPlayback() (§5.1).
+        pcm_media_position_ms_ += frame_samples * 1000u / 24000u;
+    }
+    if (is_final && !pcm_pending_bytes_.empty()) {
+        // A single leftover byte can never form a sample: drop it (no sample is shifted).
+        ESP_LOGW(TAG, "Discarding 1 trailing byte at end of PCM stream");
+        pcm_pending_bytes_.clear();
+    }
+    return true;
 }
 
 bool AudioService::IsPlaybackDrainedLocked() const {

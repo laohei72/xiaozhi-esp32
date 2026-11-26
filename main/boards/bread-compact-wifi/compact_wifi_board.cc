@@ -109,6 +109,13 @@ private:
             }
             app.ToggleChatState();
         });
+        boot_button_.OnDoubleClick([this]() {
+            // Stage-4a PCM TTS self test: plays a local 24 kHz tone through AudioService.
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() == kDeviceStateIdle) {
+                app.StartPcmTtsTest();
+            }
+        });
         boot_button_.OnLongPress([this]() {
             Application::GetInstance().StartNotifyPlayerTest();
         });

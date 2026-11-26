@@ -5,6 +5,7 @@
 #include "board.h"
 #include "cjson_utils.h"
 #include "display.h"
+#include "http.h"
 #include "mcp_server.h"
 #include "mqtt_protocol.h"
 #include "settings.h"
@@ -22,7 +23,43 @@
 
 #define TAG "Application"
 
-Application::Application() : notify_player_(audio_service_) {
+namespace {
+
+// Stage-4b self test: a fixed Chinese sentence rendered by Baidu TTS, streamed through the same
+// PCM playback path a reminder will use.
+constexpr char kBaiduTtsSelfTestText[] = "测试一下，这是提醒时间的语音播报。";
+// The only format AudioService::BeginPcmPlayback() accepts, and the format the request asks for.
+constexpr int kBaiduTtsSampleRate = BaiduTtsSource::kSampleRate;
+constexpr int kBaiduTtsChannels = BaiduTtsSource::kChannels;
+
+// Credentials are provisioned out of band and only read here: tts_api_key (AK), tts_secret_key
+// (SK) and tts_voice (speaker id, "5003" when unset) in the "reminder" NVS namespace.
+bool LoadBaiduTtsConfig(BaiduTtsConfig& config) {
+    Settings settings("reminder", false);
+    config.api_key = settings.GetString("tts_api_key");
+    config.secret_key = settings.GetString("tts_secret_key");
+    config.voice = settings.GetString("tts_voice", "5003");
+    config.cuid = SystemInfo::GetMacAddress();
+    return !config.api_key.empty() && !config.secret_key.empty();
+}
+
+// One transport per request, created on the worker task that will use it (Http is not documented
+// as thread-safe, so it is never shared between the main and the worker task).
+std::unique_ptr<Http> CreateBaiduTtsHttp() {
+    auto* network = Board::GetInstance().GetNetwork();
+    if (network == nullptr) {
+        ESP_LOGW(TAG, "No network available for the Baidu TTS request");
+        return nullptr;
+    }
+    return network->CreateHttp(0);
+}
+
+}  // namespace
+
+Application::Application()
+    : notify_player_(audio_service_),
+      baidu_tts_source_(&LoadBaiduTtsConfig, &CreateBaiduTtsHttp),
+      pcm_tts_player_(audio_service_) {
     event_group_ = xEventGroupCreate();
 
 #if CONFIG_USE_DEVICE_AEC && CONFIG_USE_SERVER_AEC
@@ -49,6 +86,7 @@ Application::Application() : notify_player_(audio_service_) {
 }
 
 Application::~Application() {
+    pcm_tts_player_.Stop();
     notify_player_.Stop();
     if (clock_timer_handle_ != nullptr) {
         esp_timer_stop(clock_timer_handle_);
@@ -211,6 +249,7 @@ void Application::Run() {
             if (GetDeviceState() == kDeviceStateNotifying) {
                 StopNotification();
             }
+            StopPcmTts("protocol error");
             SetDeviceState(kDeviceStateIdle);
             Alert(Lang::Strings::ERROR, last_error_message_.c_str(), "cancel",
                   Lang::Sounds::OGG_EXCLAMATION);
@@ -347,6 +386,7 @@ void Application::HandleNetworkDisconnectedEvent() {
     if (state == kDeviceStateNotifying) {
         StopNotification();
     }
+    StopPcmTts("network disconnected");
     if (state == kDeviceStateConnecting || state == kDeviceStateListening ||
         state == kDeviceStateSpeaking) {
         ESP_LOGI(TAG, "Closing audio channel due to network disconnection");
@@ -591,6 +631,12 @@ void Application::InitializeProtocol() {
     });
 
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
+        if (pcm_tts_player_.IsBusy()) {
+            // §9.5: the shared playback path belongs to the local PCM session. Decoding an Opus
+            // frame here would interleave two sources and skew EndPcmPlayback()'s drain check.
+            pcm_tts_dropped_packets_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         if (GetDeviceState() == kDeviceStateSpeaking) {
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
         }
@@ -662,11 +708,21 @@ void Application::InitializeProtocol() {
             }
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this]() {
+                    if (pcm_tts_player_.IsBusy()) {
+                        // A local PCM utterance owns the speaking state and the playback path, so
+                        // switching here would interleave server Opus with it (§9.5).
+                        ESP_LOGW(TAG, "Ignoring TTS start while a PCM TTS session is active");
+                        return;
+                    }
                     aborted_ = false;
                     SetDeviceState(kDeviceStateSpeaking);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
+                    if (pcm_tts_player_.IsBusy()) {
+                        ESP_LOGW(TAG, "Ignoring TTS stop while a PCM TTS session is active");
+                        return;
+                    }
                     if (GetDeviceState() == kDeviceStateSpeaking) {
                         if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
@@ -822,6 +878,11 @@ void Application::HandleToggleChatEvent() {
         StopNotification();
         state = kDeviceStateIdle;
     }
+    if (state == kDeviceStateSpeaking && StopPcmTts("chat toggle")) {
+        // A local PCM utterance was cancelled; fall through as idle so the same click starts a
+        // conversation instead of being swallowed by the cancel.
+        state = kDeviceStateIdle;
+    }
 
     if (state == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
@@ -886,6 +947,10 @@ void Application::HandleStartListeningEvent() {
         StopNotification();
         state = kDeviceStateIdle;
     }
+    if (state == kDeviceStateSpeaking && StopPcmTts("start listening")) {
+        // Push-to-talk pressed during a local utterance: cancel it and listen instead.
+        state = kDeviceStateIdle;
+    }
 
     if (state == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
@@ -920,6 +985,10 @@ void Application::HandleStopListeningEvent() {
 
     if (state == kDeviceStateNotifying) {
         StopNotification();
+    } else if (state == kDeviceStateSpeaking) {
+        // Releasing push-to-talk during a local utterance cancels it; a server TTS reply is left
+        // alone, which matches the behaviour before PCM playback existed.
+        StopPcmTts("stop listening");
     } else if (state == kDeviceStateAudioTesting) {
         audio_service_.EnableAudioTesting(false);
         SetDeviceState(kDeviceStateWifiConfiguring);
@@ -933,12 +1002,19 @@ void Application::HandleStopListeningEvent() {
 }
 
 void Application::HandleWakeWordDetectedEvent() {
+    auto state = GetDeviceState();
+    auto wake_word = audio_service_.GetLastWakeWord();
+
+    if (state == kDeviceStateSpeaking && StopPcmTts("wake word detected")) {
+        // A reminder or local reply was cancelled. Handle it before the protocol check so a local
+        // utterance can still be interrupted while the device is offline.
+        state = kDeviceStateIdle;
+    }
+
     if (!protocol_) {
         return;
     }
 
-    auto state = GetDeviceState();
-    auto wake_word = audio_service_.GetLastWakeWord();
     ESP_LOGI(TAG, "Wake word detected: %s (state: %d)", wake_word.c_str(), (int)state);
 
     if (state == kDeviceStateIdle) {
@@ -1089,7 +1165,11 @@ void Application::HandleStateChangedEvent() {
                 // Only AFE wake word can be detected in speaking mode
                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
             }
-            audio_service_.ResetDecoder();
+            // A local PCM utterance owns the shared playback path: ResetDecoder() would bump the
+            // playback generation and truncate the stream (§9.5), so only clear Opus state here.
+            if (!pcm_tts_player_.IsBusy()) {
+                audio_service_.ResetDecoder();
+            }
             break;
         case kDeviceStateNotifying:
             display->SetStatus(Lang::Strings::SPEAKING);
@@ -1282,6 +1362,124 @@ void Application::HandleNotificationFinished(uint32_t playback_id, bool success)
     StopNotification();
 }
 
+void Application::StartPcmTtsTest() {
+    Schedule([this]() {
+        if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy() ||
+            pcm_tts_player_.IsBusy()) {
+            ESP_LOGW(TAG, "PCM TTS test ignored: device is busy");
+            return;
+        }
+        // Stage 4b: a fixed Chinese sentence from Baidu TTS behind the same reader interface a
+        // reminder will use. The source opens itself on the player's worker task, so the token and
+        // the request never block the main event loop.
+        PcmTtsPlayer::ChunkReader reader = [this](std::vector<uint8_t>& chunk) {
+            return baidu_tts_source_.Read(chunk);
+        };
+        PcmTtsPlayer::PrepareCallback prepare = [this]() {
+            return baidu_tts_source_.Open(kBaiduTtsSelfTestText);
+        };
+        PcmTtsPlayer::CloseCallback close = [this]() { baidu_tts_source_.Close(); };
+        if (!StartPcmTtsSession("baidu tts", kBaiduTtsSampleRate, kBaiduTtsChannels,
+                                std::move(reader), std::move(prepare), std::move(close))) {
+            ESP_LOGE(TAG, "Failed to start the PCM TTS test");
+        }
+    });
+}
+
+bool Application::StartPcmTtsSession(const char* source, int sample_rate, int channels,
+                                     PcmTtsPlayer::ChunkReader reader,
+                                     PcmTtsPlayer::PrepareCallback prepare,
+                                     PcmTtsPlayer::CloseCallback close) {
+    if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy() ||
+        pcm_tts_player_.IsBusy()) {
+        ESP_LOGW(TAG, "PCM TTS (%s) ignored: device is not idle", source);
+        return false;
+    }
+
+    auto& board = Board::GetInstance();
+    board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    // Drop microphone audio and any Opus tail left from a previous conversation: the shared
+    // playback queue must belong to the PCM session alone (§9.5). The Speaking state handler
+    // skips its own ResetDecoder() while the session is busy, so this is the only reset.
+    while (audio_service_.PopPacketFromSendQueue()) {
+    }
+    audio_service_.ResetDecoder();
+
+    if (!SetDeviceState(kDeviceStateSpeaking)) {
+        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        return false;
+    }
+
+    const uint32_t session_id = pcm_tts_player_.Start(
+        sample_rate, channels, std::move(reader),
+        [this](uint32_t id, PcmTtsPlayer::Error error) { HandlePcmTtsFinished(id, error); },
+        std::move(prepare), std::move(close));
+    if (session_id == 0) {
+        ESP_LOGE(TAG, "PCM TTS (%s): player refused to start", source);
+        SetDeviceState(kDeviceStateIdle);
+        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        return false;
+    }
+
+    pcm_tts_session_id_ = session_id;
+    pcm_tts_dropped_packets_.store(0);
+    board.GetDisplay()->SetChatMessage("assistant", "");
+    ESP_LOGI(TAG, "PCM TTS (%s) session %lu started: %d Hz / %d channel", source,
+             static_cast<unsigned long>(session_id), sample_rate, channels);
+    return true;
+}
+
+bool Application::StopPcmTts(const char* reason) {
+    if (!pcm_tts_player_.IsBusy()) {
+        return false;
+    }
+    ESP_LOGI(TAG, "Stopping PCM TTS session %lu: %s",
+             static_cast<unsigned long>(pcm_tts_player_.session_id()), reason);
+    // Tell the source first: it flips an atomic generation counter, so a blocked token or body
+    // read returns without touching the transport from this (main) task.
+    baidu_tts_source_.Cancel();
+    // Cancels on the player's worker task; the worker reports kCancelled through
+    // HandlePcmTtsFinished(), which restores the idle state if we leave it Speaking here.
+    pcm_tts_player_.Stop();
+    audio_service_.ResetDecoder();
+    auto& board = Board::GetInstance();
+    board.GetDisplay()->SetChatMessage("assistant", "");
+    board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+    if (GetDeviceState() == kDeviceStateSpeaking) {
+        SetDeviceState(kDeviceStateIdle);
+    }
+    return true;
+}
+
+void Application::HandlePcmTtsFinished(uint32_t session_id, PcmTtsPlayer::Error error) {
+    // Worker-task context: hop to the main task before touching state, display or power save.
+    Schedule([this, session_id, error]() {
+        if (session_id != pcm_tts_session_id_) {
+            ESP_LOGW(TAG, "Ignoring completion of stale PCM TTS session %lu",
+                     static_cast<unsigned long>(session_id));
+            return;
+        }
+        pcm_tts_session_id_ = 0;
+        const uint32_t dropped = pcm_tts_dropped_packets_.exchange(0);
+        if (dropped > 0) {
+            ESP_LOGW(TAG, "Dropped %lu server audio packets during PCM TTS playback",
+                     static_cast<unsigned long>(dropped));
+        }
+        if (error == PcmTtsPlayer::Error::kSuccess) {
+            ESP_LOGI(TAG, "PCM TTS session %lu finished", static_cast<unsigned long>(session_id));
+        } else {
+            // kCancelled is the normal outcome of a user interrupt, so it is not an error.
+            ESP_LOGW(TAG, "PCM TTS session %lu finished with %s",
+                     static_cast<unsigned long>(session_id), PcmTtsPlayer::GetErrorName(error));
+        }
+        Board::GetInstance().GetDisplay()->SetChatMessage("assistant", "");
+        if (GetDeviceState() == kDeviceStateSpeaking) {
+            SetDeviceState(kDeviceStateIdle);
+        }
+        Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+    });
+}
+
 void Application::Schedule(std::function<void()>&& callback) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1312,6 +1510,7 @@ void Application::Reboot() {
     if (GetDeviceState() == kDeviceStateNotifying) {
         StopNotification();
     }
+    StopPcmTts("reboot");
     // Disconnect the audio channel
     if (protocol_ && protocol_->IsAudioChannelOpened()) {
         protocol_->CloseAudioChannel();
@@ -1333,6 +1532,7 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
     if (GetDeviceState() == kDeviceStateNotifying) {
         StopNotification();
     }
+    StopPcmTts("firmware upgrade");
 
     // Close audio channel if it's open
     if (protocol_ && protocol_->IsAudioChannelOpened()) {
@@ -1405,7 +1605,10 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
             }
         });
     } else if (state == kDeviceStateSpeaking) {
-        Schedule([this]() { AbortSpeaking(kAbortReasonNone); });
+        Schedule([this]() {
+            StopPcmTts("wake word invoke");
+            AbortSpeaking(kAbortReasonNone);
+        });
     } else if (state == kDeviceStateListening) {
         Schedule([this]() {
             if (protocol_) {
@@ -1482,6 +1685,7 @@ void Application::ResetProtocol() {
         if (GetDeviceState() == kDeviceStateNotifying) {
             StopNotification();
         }
+        StopPcmTts("reset protocol");
         // Close audio channel if opened
         if (protocol_ && protocol_->IsAudioChannelOpened()) {
             protocol_->CloseAudioChannel();

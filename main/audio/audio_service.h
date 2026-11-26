@@ -48,6 +48,12 @@
 #define AUDIO_POWER_TIMEOUT_MS 15000
 #define AUDIO_POWER_CHECK_INTERVAL_MS 1000
 
+// PCM playback (24 kHz mono s16le pass-through), see docs/PCM_PLAYBACK_DESIGN.md §4.1
+#define PCM_PLAYBACK_FRAME_DURATION_MS 60  // aligned with OPUS_FRAME_DURATION_MS
+#define PCM_PLAYBACK_CHUNK_SAMPLES 1440    // 60 ms @ 24 kHz mono
+#define PCM_PLAYBACK_CHUNK_BYTES (PCM_PLAYBACK_CHUNK_SAMPLES * sizeof(int16_t))  // 2880
+#define PCM_PLAYBACK_DRAIN_TIMEOUT_MS 5000
+
 #define AS_EVENT_AUDIO_TESTING_RUNNING (1 << 0)
 #define AS_EVENT_WAKE_WORD_RUNNING (1 << 1)
 #define AS_EVENT_AUDIO_PROCESSOR_RUNNING (1 << 2)
@@ -149,6 +155,21 @@ public:
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
 
+    // PCM playback session control (docs/PCM_PLAYBACK_DESIGN.md §3.1).
+    // Begin/Abort are control-plane operations and must be serialized on one thread
+    // (§6.3); no additional lock is added to enforce that contract.
+    bool BeginPcmPlayback(int input_sample_rate, int input_channels, uint32_t playback_id = 0);
+    // Feeds one HTTP chunk of little-endian s16le bytes. Returns false when the session was
+    // cancelled (Abort/End/Stop/ResetDecoder); the caller must stop reading and close HTTP.
+    bool WritePcmData(const uint8_t* data, size_t size, bool last = false);
+    // Ends the session: pushes the tail frame, then waits for the shared playback path to drain.
+    // Returns true only on a normal drain; false when cancelled while waiting (Abort/Stop/
+    // ResetDecoder, or a stale token during the tail push) or on timeout (the queue is never
+    // cleared here). pcm_stream_active_ is false on every return path (§9.1, §9.4).
+    bool EndPcmPlayback(uint32_t timeout_ms = PCM_PLAYBACK_DRAIN_TIMEOUT_MS);
+    void AbortPcmPlayback();
+    bool IsPcmPlaybackActive() const;
+
 private:
     AudioCodec* codec_ = nullptr;
     AudioServiceCallbacks callbacks_;
@@ -198,6 +219,21 @@ private:
     // For server AEC
     FixedQueue<uint32_t, MAX_TIMESTAMPS_IN_QUEUE> timestamp_queue_;
 
+    // PCM playback session (docs/PCM_PLAYBACK_DESIGN.md §4.2). pcm_mutex_ guards all PCM
+    // state below; playback_generation_ stays guarded by audio_queue_mutex_.
+    // Lock order: pcm_mutex_ -> audio_queue_mutex_, never the reverse (§6.3).
+    std::vector<uint8_t> pcm_pending_bytes_;
+    std::mutex pcm_mutex_;
+    // Incremented only by AbortPcmPlayback() before it takes any lock (§6.3).
+    std::atomic<uint32_t> pcm_stream_generation_{0};
+    // Session cancellation tokens, snapshotted once by BeginPcmPlayback(), read-only after.
+    uint32_t pcm_session_pcm_gen_ = 0;
+    uint32_t pcm_session_playback_gen_ = 0;
+    // Writable flag; only BeginPcmPlayback()/EndPcmPlayback()/AbortPcmPlayback() change it.
+    bool pcm_stream_active_ = false;
+    uint32_t pcm_playback_id_ = 0;
+    uint32_t pcm_media_position_ms_ = 0;
+
     bool audio_engine_initialized_ = false;
     bool voice_detected_ = false;
 #if CONFIG_USE_DEVICE_AEC
@@ -221,6 +257,15 @@ private:
     void CheckAndUpdateAudioPowerState();
     bool IsPlaybackDrainedLocked() const;
     bool MarkPlaybackDrainedLocked();
+    // PCM producer entry: hands one 24 kHz frame to the shared playback queue. The two
+    // parameters are this session's fixed tokens; the function never re-reads them and never
+    // compares them with each other (§6.2.2). Caller must hold pcm_mutex_.
+    bool PushPcmTaskToPlaybackQueue(std::vector<int16_t>&& pcm, uint32_t pcm_generation,
+                                    uint32_t playback_generation);
+    // Splits pcm_pending_bytes_ into full frames (1440 samples) and pushes them; is_final
+    // allows a short tail frame. Caller must hold pcm_mutex_. Tokens are passed through
+    // unchanged: this function never reads the live generations (§7.3).
+    bool FlushPcmPendingBytes(bool is_final, uint32_t pcm_generation, uint32_t playback_generation);
 };
 
 #endif

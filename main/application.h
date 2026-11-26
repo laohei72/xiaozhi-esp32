@@ -12,6 +12,7 @@
 #include <memory>
 #include <functional>
 #include <cstdint>
+#include <atomic>
 #include <vector>
 
 #include "protocol.h"
@@ -20,6 +21,8 @@
 #include "device_state.h"
 #include "device_state_machine.h"
 #include "notify/notify_player.h"
+#include "reminder/baidu_tts_source.h"
+#include "reminder/pcm_tts_player.h"
 
 // Main event bits
 #define MAIN_EVENT_SCHEDULE             (1 << 0)
@@ -120,6 +123,7 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     void StartNotifyPlayerTest();
+    void StartPcmTtsTest();
     AudioService& GetAudioService() { return audio_service_; }
     
     /**
@@ -146,7 +150,15 @@ private:
     std::string startup_wake_word_hint_message_;
     AudioService audio_service_;
     NotifyPlayer notify_player_;
+    // Baidu TTS transport of the PCM utterances. Declared before the player so it outlives the
+    // player's worker task, which owns every Http call of a session.
+    BaiduTtsSource baidu_tts_source_;
+    PcmTtsPlayer pcm_tts_player_;
     uint32_t notification_playback_id_ = 0;
+    // Session id of the PCM TTS utterance the UI is currently showing; 0 when none is active.
+    uint32_t pcm_tts_session_id_ = 0;
+    // Server Opus frames dropped while a PCM session owned the playback path (§9.5).
+    std::atomic<uint32_t> pcm_tts_dropped_packets_{0};
     std::unique_ptr<Ota> ota_;
 
     std::function<void(const std::string&)> mcp_broadcast_callback_;
@@ -181,6 +193,15 @@ private:
     void StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles);
     void StopNotification();
     void HandleNotificationFinished(uint32_t playback_id, bool success);
+    // PCM TTS (main/reminder/pcm_tts_player.*). StartPcmTtsSession() must run in the main task.
+    bool StartPcmTtsSession(const char* source, int sample_rate, int channels,
+                            PcmTtsPlayer::ChunkReader reader,
+                            PcmTtsPlayer::PrepareCallback prepare = nullptr,
+                            PcmTtsPlayer::CloseCallback close = nullptr);
+    // Cancels the active PCM utterance; returns true when one was running.
+    bool StopPcmTts(const char* reason);
+    // Runs on the player's worker task: only schedules work for the main task.
+    void HandlePcmTtsFinished(uint32_t session_id, PcmTtsPlayer::Error error);
 
     // Activation task (runs in background)
     void ActivationTask();
