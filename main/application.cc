@@ -1752,7 +1752,7 @@ void Application::StartProactiveGreeting() {
 #if defined(CONFIG_CUSTOM_WAKE_WORD_DISPLAY)
         const std::string greeting = CONFIG_CUSTOM_WAKE_WORD_DISPLAY;
 #else
-        const std::string greeting = "Hi ESP";
+        const std::string greeting = "小智你好呀";
 #endif
         ESP_LOGI(TAG, "Starting proactive greeting: %s", greeting.c_str());
         // Kconfig describes CUSTOM_WAKE_WORD_DISPLAY as the greeting sent to the server.
