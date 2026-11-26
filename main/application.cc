@@ -322,6 +322,14 @@ void Application::Run() {
                 pending_listening_start_ = false;
                 StartListeningAudio();
             }
+            // Start the reminder TTS only after the popup chime has fully drained.
+            if (reminder_chime_pending_ && !reminder_chime_start_pending_ &&
+                GetDeviceState() == kDeviceStateSpeaking && audio_service_.IsPlaybackIdle() &&
+                !pcm_tts_player_.IsBusy()) {
+                ReminderTask task = std::move(pending_reminder_task_);
+                reminder_chime_pending_ = false;
+                StartReminderPlayback(task);
+            }
         }
 
         if (bits & MAIN_EVENT_TOGGLE_CHAT) {
@@ -1161,6 +1169,9 @@ void Application::HandleStateChangedEvent() {
     auto display = board.GetDisplay();
     auto led = board.GetLed();
     led->OnStateChanged();
+    if (new_state != kDeviceStateSpeaking && reminder_chime_pending_) {
+        reminder_chime_start_pending_ = false;
+    }
 
     switch (new_state) {
         case kDeviceStateUnknown:
@@ -1213,6 +1224,10 @@ void Application::HandleStateChangedEvent() {
             // playback generation and truncate the stream (§9.5), so only clear Opus state here.
             if (!pcm_tts_player_.IsBusy()) {
                 audio_service_.ResetDecoder();
+            }
+            if (reminder_chime_pending_ && reminder_chime_start_pending_) {
+                reminder_chime_start_pending_ = false;
+                audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
             }
             break;
         case kDeviceStateNotifying:
@@ -1502,10 +1517,22 @@ void Application::HandleReminderTick() {
     // and a recurring task is re-armed by OnPlaybackFinished() once it played.
     reminder_manager_.MarkDueTasks();
 
-    // Never talk over a conversation, a notification or another utterance. The task stays due, so
-    // nothing is lost by skipping it here.
+    if (reminder_chime_pending_) {
+        // If a user interaction interrupted the chime, wait until idle and replay it.
+        if (GetDeviceState() == kDeviceStateIdle && !notify_player_.IsBusy() &&
+            !pcm_tts_player_.IsBusy() && audio_service_.IsPlaybackIdle() &&
+            NowMonotonicMs() >= reminder_retry_not_before_ms_) {
+            reminder_chime_start_pending_ = true;
+            if (!SetDeviceState(kDeviceStateSpeaking)) {
+                reminder_chime_start_pending_ = false;
+            }
+        }
+        return;
+    }
+
+    // Never talk over a conversation, a notification, or another utterance.
     if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy() ||
-        pcm_tts_player_.IsBusy()) {
+        pcm_tts_player_.IsBusy() || !audio_service_.IsPlaybackIdle()) {
         return;
     }
     if (NowMonotonicMs() < reminder_retry_not_before_ms_) {
@@ -1516,7 +1543,15 @@ void Application::HandleReminderTick() {
     if (!reminder_manager_.TakeNextDueTask(task)) {
         return;
     }
-    StartReminderPlayback(task);
+
+    pending_reminder_task_ = std::move(task);
+    reminder_chime_pending_ = true;
+    reminder_chime_start_pending_ = true;
+    if (!SetDeviceState(kDeviceStateSpeaking)) {
+        reminder_chime_pending_ = false;
+        reminder_chime_start_pending_ = false;
+        ESP_LOGW(TAG, "Failed to enter speaking state for reminder chime");
+    }
 }
 
 bool Application::StartReminderPlayback(const ReminderTask& task) {
@@ -1690,6 +1725,29 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
         Reboot();
         return true;
     }
+}
+
+void Application::StartProactiveGreeting() {
+    // Button and PIR callbacks can run outside the main task; serialize on the main event loop.
+    Schedule([this]() {
+        if (!protocol_ || GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy() ||
+            pcm_tts_player_.IsBusy() || !audio_service_.IsPlaybackIdle()) {
+            ESP_LOGD(TAG, "Ignoring proactive greeting while device is busy");
+            return;
+        }
+#if defined(CONFIG_SEND_WAKE_WORD_DATA) && CONFIG_SEND_WAKE_WORD_DATA
+#if defined(CONFIG_CUSTOM_WAKE_WORD_DISPLAY)
+        const std::string greeting = CONFIG_CUSTOM_WAKE_WORD_DISPLAY;
+#else
+        const std::string greeting = "Hi ESP";
+#endif
+        ESP_LOGI(TAG, "Starting proactive greeting: %s", greeting.c_str());
+        // Kconfig describes CUSTOM_WAKE_WORD_DISPLAY as the greeting sent to the server.
+        BeginWakeWordInvoke(greeting);
+#else
+        ESP_LOGW(TAG, "Proactive greeting requires SEND_WAKE_WORD_DATA to be enabled");
+#endif
+    });
 }
 
 void Application::WakeWordInvoke(const std::string& wake_word) {

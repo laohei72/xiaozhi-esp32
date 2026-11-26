@@ -14,6 +14,7 @@
 #include <driver/i2c_master.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
+#include <esp_timer.h>
 
 #ifdef SH1106
 #include <esp_lcd_panel_sh1106.h>
@@ -31,6 +32,44 @@ private:
     Button touch_button_;
     Button volume_up_button_;
     Button volume_down_button_;
+    esp_timer_handle_t pir_poll_timer_ = nullptr;
+    int pir_last_level_ = 0;
+    int64_t pir_last_trigger_us_ = 0;
+
+    void InitializePirSensor() {
+        gpio_config_t config = {};
+        config.pin_bit_mask = 1ULL << PIR_SENSOR_GPIO;
+        config.mode = GPIO_MODE_INPUT;
+        config.pull_up_en = GPIO_PULLUP_DISABLE;
+        config.pull_down_en = GPIO_PULLDOWN_ENABLE;
+        config.intr_type = GPIO_INTR_DISABLE;
+        ESP_ERROR_CHECK(gpio_config(&config));
+        pir_last_level_ = gpio_get_level(PIR_SENSOR_GPIO);
+
+        esp_timer_create_args_t timer_args = {
+            .callback = [](void* arg) {
+                auto* board = static_cast<CompactWifiBoard*>(arg);
+                const int level = gpio_get_level(PIR_SENSOR_GPIO);
+                if (level != 0 && board->pir_last_level_ == 0) {
+                    const int64_t now = esp_timer_get_time();
+                    constexpr int64_t kPirCooldownUs = 20LL * 1000 * 1000;
+                    if (board->pir_last_trigger_us_ == 0 ||
+                        now - board->pir_last_trigger_us_ >= kPirCooldownUs) {
+                        board->pir_last_trigger_us_ = now;
+                        ESP_LOGI(TAG, "PIR motion detected");
+                        Application::GetInstance().StartProactiveGreeting();
+                    }
+                }
+                board->pir_last_level_ = level;
+            },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "pir_poll",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &pir_poll_timer_));
+        ESP_ERROR_CHECK(esp_timer_start_periodic(pir_poll_timer_, 100 * 1000));
+    }
 
     void InitializeDisplayI2c() {
         i2c_master_bus_config_t bus_config = {
@@ -107,7 +146,7 @@ private:
                 EnterWifiConfigMode();
                 return;
             }
-            app.ToggleChatState();
+            app.StartProactiveGreeting();
         });
         boot_button_.OnDoubleClick([this]() {
             // Stage-4a PCM TTS self test: plays a local 24 kHz tone through AudioService.
@@ -171,6 +210,7 @@ public:
         InitializeDisplayI2c();
         InitializeSsd1306Display();
         InitializeButtons();
+        InitializePirSensor();
         InitializeTools();
     }
 
