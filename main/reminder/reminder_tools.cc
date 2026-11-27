@@ -322,29 +322,37 @@ void RegisterReminderTools(ReminderManager& manager) {
 
     mcp_server.AddTool(
         "self.reminders.respond",
-        "Resolve the reminder that is currently awaiting the user's response. First call "
-        "`self.reminders.list` and confirm there is exactly one task with state "
-        "`awaiting_response`. Call this tool with action `complete` ONLY when the user "
-        "clearly confirms the reminder has been handled (for example, 'done', 'I did it', or Chinese '已经处理了'). '好的' or '知道了' alone are NOT confirmation. "
-        "Call it with action `snooze` when the user explicitly asks to be reminded later; "
-        "set `delay_seconds` to the requested delay (use 300 seconds for an unspecified "
-        "short delay). If the user asks what the reminder means, asks a question, discusses "
-        "it, or gives an unclear response, DO NOT call this tool: answer and continue the "
-        "conversation, leaving the reminder awaiting a response. Never treat any arbitrary "
-        "speech as completion. This tool acts only on the sole active awaiting-response task.",
+        "Resolve one specific reminder after first calling `self.reminders.list` and reading its "
+        "id and state. Pass that exact `id`. Use action `complete` ONLY when the user clearly "
+        "confirms that reminder has been handled (for example, 'done', 'I did it', or Chinese "
+        "'已经处理了'); '好的' or '知道了' alone are NOT confirmation. Use action `snooze` when "
+        "the user explicitly says they will handle it later (for example, '我等会再喝', "
+        "'稍后看', '半小时后再提醒我'); provide `delay_seconds` in seconds. If no delay is "
+        "specified, use 300 seconds. This tool can resolve a task in `awaiting_response` or "
+        "`paused` state. If the user asks a question, discusses the reminder, or says unrelated "
+        "things without asking to postpone it, DO NOT call this tool; continue the conversation "
+        "and leave the reminder unresolved. Never infer completion or snooze from arbitrary speech.",
         PropertyList({
+            Property("id", kPropertyTypeInteger, 1, 65535),
             Property("action", kPropertyTypeString),
-            Property("delay_seconds", kPropertyTypeInteger, 300, 1, 7 * 24 * 60 * 60),
+            Property("delay_seconds", kPropertyTypeInteger, 1, 7 * 24 * 60 * 60),
         }),
         [&manager](const PropertyList& properties) -> ToolResult {
+            const uint32_t id = static_cast<uint32_t>(properties["id"].value<int>());
             const std::string action = properties["action"].value<std::string>();
             if (action != "complete" && action != "snooze") {
                 return std::unexpected("action must be complete or snooze");
             }
-            const uint64_t delay_ms =
-                static_cast<uint64_t>(properties["delay_seconds"].value<int>()) * 1000;
+            uint64_t delay_ms = 0;
+            if (action == "snooze") {
+                const int delay_seconds = properties["delay_seconds"].value<int>();
+                if (delay_seconds < 1 || delay_seconds > 7 * 24 * 60 * 60) {
+                    return std::unexpected("snooze requires delay_seconds from 1 to 604800");
+                }
+                delay_ms = static_cast<uint64_t>(delay_seconds) * 1000;
+            }
             std::string error;
-            if (!manager.ResolveAwaitingResponse(action == "complete", delay_ms, error)) {
+            if (!manager.ResolveReminderResponse(id, action == "complete", delay_ms, error)) {
                 return std::unexpected(error);
             }
             return true;
