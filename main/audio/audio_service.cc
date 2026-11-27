@@ -507,8 +507,13 @@ void AudioService::OpusCodecTask() {
         if (!audio_encode_queue_.empty()) {
             auto task = std::move(audio_encode_queue_.front());
             audio_encode_queue_.pop_front();
+            const uint32_t mute_generation = microphone_mute_generation_.load();
             audio_queue_cv_.notify_all();
             lock.unlock();
+            if (microphone_muted_.load()) {
+                lock.lock();
+                continue;
+            }
 
             auto packet = std::make_unique<AudioStreamPacket>();
             packet->frame_duration = OPUS_FRAME_DURATION_MS;
@@ -527,7 +532,8 @@ void AudioService::OpusCodecTask() {
                     .encoded_bytes = 0,
                 };
                 auto ret = esp_opus_enc_process(opus_encoder_, &in, &out);
-                if (ret == ESP_AUDIO_ERR_OK) {
+                if (ret == ESP_AUDIO_ERR_OK && !microphone_muted_.load() &&
+                    mute_generation == microphone_mute_generation_.load()) {
                     packet->payload.resize(out.encoded_bytes);
 
                     if (task.type == kAudioTaskTypeEncodeToSendQueue) {
@@ -608,6 +614,9 @@ void AudioService::SetDecodeSampleRate(int sample_rate, int frame_duration) {
 }
 
 void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm) {
+    if (microphone_muted_.load()) {
+        return;
+    }
     AudioTask task;
     task.type = type;
     task.pcm = std::move(pcm);
@@ -616,6 +625,9 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
     {
         /* Push the task to the encode queue */
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+        if (microphone_muted_.load()) {
+            return;
+        }
 
         /* If the task is to send queue, we need to set the timestamp */
         if (type == kAudioTaskTypeEncodeToSendQueue && !timestamp_queue_.empty()) {
@@ -671,6 +683,10 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
 
 std::unique_ptr<AudioStreamPacket> AudioService::PopPacketFromSendQueue() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    if (microphone_muted_.load()) {
+        audio_send_queue_.clear();
+        return nullptr;
+    }
     if (audio_send_queue_.empty()) {
         return nullptr;
     }
@@ -809,7 +825,22 @@ void AudioService::SetMicrophoneMuted(bool muted) {
     if (previous == muted) {
         return;
     }
+    microphone_mute_generation_.fetch_add(1);
     ESP_LOGI(TAG, "Microphone %s", muted ? "muted" : "unmuted");
+
+    // Invalidate audio captured before this transition, including a frame currently being
+    // encoded by OpusCodecTask. Do not let queued speech leak out after mute is pressed.
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        audio_encode_queue_.clear();
+        audio_send_queue_.clear();
+        audio_testing_queue_.clear();
+        timestamp_queue_.clear();
+        audio_queue_cv_.notify_all();
+    }
+    if (audio_engine_initialized_ && audio_engine_ != nullptr) {
+        audio_engine_->ClearWakeWordData();
+    }
     if (!muted) {
         // Discard the first input interval after I2S RX is restarted.
         audio_input_need_warmup_.store(true);
