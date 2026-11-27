@@ -90,6 +90,10 @@ void AudioService::Initialize(AudioCodec* codec) {
     audio_engine_ = std::make_unique<LiteAudioEngine>();
 #endif
     audio_engine_->OnOutput([this](std::vector<int16_t>&& data) {
+        // Drop any buffered AFE output after mute is engaged.
+        if (microphone_muted_.load()) {
+            return;
+        }
         PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
     });
     audio_engine_->OnVadStateChange([this](bool speaking) {
@@ -100,6 +104,12 @@ void AudioService::Initialize(AudioCodec* codec) {
     });
     audio_engine_->OnWakeWordDetected([this](const std::string& wake_word) {
         xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
+        if (microphone_muted_.load()) {
+            // AFE may finish processing a frame captured just before mute. Ignore it and
+            // restore detection so unmuting does not leave wake-word detection disabled.
+            EnableWakeWordDetection(true);
+            return;
+        }
         if (callbacks_.on_wake_word_detected) {
             callbacks_.on_wake_word_detected(wake_word);
         }
@@ -198,6 +208,9 @@ void AudioService::Stop() {
 }
 
 bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples) {
+    if (microphone_muted_.load()) {
+        return false;
+    }
     if (!codec_->input_enabled()) {
         esp_timer_stop(audio_power_timer_);
         esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
@@ -227,6 +240,13 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
         if (!codec_->InputData(data)) {
             return false;
         }
+    }
+
+    // Mute may have been pressed while the I2S read was in progress. Never pass that frame
+    // to the debugger, AFE, or Opus encoder.
+    if (microphone_muted_.load()) {
+        data.clear();
+        return false;
     }
 
     /* Update the last input time */
@@ -276,6 +296,22 @@ void AudioService::AudioInputTask() {
                 // Do not process the stale active bits returned by waitBits().
                 continue;
             }
+        }
+
+        if (microphone_muted_.load()) {
+            // Only this task controls the codec RX channel. Stop sampling instead of merely
+            // feeding zero-valued audio into the recognition pipeline.
+            if (codec_->input_enabled()) {
+                codec_->EnableInput(false);
+            }
+            // Feed silence to drain any audio already buffered inside AFE; output callbacks
+            // are independently gated while muted.
+            if (bits & (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING)) {
+                std::vector<int16_t> silence(160 * codec_->input_channels(), 0);
+                audio_engine_->Feed(std::move(silence));
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
         }
 
         if (audio_input_need_warmup_.exchange(false)) {
@@ -765,6 +801,18 @@ void AudioService::EnableDeviceAec(bool enable) {
         audio_engine_->EnableDeviceAec(enable);
     } else {
         ESP_LOGI(TAG, "Deferring AEC change until the audio engine is initialized");
+    }
+}
+
+void AudioService::SetMicrophoneMuted(bool muted) {
+    const bool previous = microphone_muted_.exchange(muted);
+    if (previous == muted) {
+        return;
+    }
+    ESP_LOGI(TAG, "Microphone %s", muted ? "muted" : "unmuted");
+    if (!muted) {
+        // Discard the first input interval after I2S RX is restarted.
+        audio_input_need_warmup_.store(true);
     }
 }
 
