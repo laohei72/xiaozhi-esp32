@@ -234,6 +234,23 @@ void WifiBoard::EnterWifiConfigMode() {
     StartWifiConfigMode();
 }
 
+void WifiBoard::ReconnectWifi() {
+    if (IsInWifiConfigMode()) {
+        ESP_LOGW(TAG, "Ignoring WiFi reconnect while configuration mode is active");
+        return;
+    }
+    if (SsidManager::GetInstance().GetSsidList().empty()) {
+        ESP_LOGW(TAG, "Cannot reconnect: no saved WiFi network");
+        EnterWifiConfigMode();
+        return;
+    }
+
+    ESP_LOGI(TAG, "Restarting WiFi station connection");
+    esp_timer_stop(connect_timer_);
+    WifiManager::GetInstance().StopStation();
+    TryWifiConnect();
+}
+
 bool WifiBoard::IsInWifiConfigMode() const {
     return WifiManager::GetInstance().IsConfigMode();
 }
