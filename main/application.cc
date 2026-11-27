@@ -16,6 +16,7 @@
 
 #include <driver/gpio.h>
 #include <esp_log.h>
+#include <nvs_flash.h>
 #include <arpa/inet.h>
 #include <cJSON.h>
 #include <algorithm>
@@ -134,6 +135,22 @@ bool Application::SetDeviceState(DeviceState state) { return state_machine_.Tran
 void Application::Initialize() {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
+    // Temporary, read-only NVS snapshot. Remove after collecting one boot log.
+    nvs_stats_t nvs_stats = {};
+    esp_err_t nvs_stats_err = nvs_get_stats(nullptr, &nvs_stats);
+    if (nvs_stats_err == ESP_OK) {
+        ESP_LOGW("NVSDiag", "entries: used=%zu free=%zu available=%zu total=%zu namespaces=%zu",
+                 nvs_stats.used_entries, nvs_stats.free_entries, nvs_stats.available_entries,
+                 nvs_stats.total_entries, nvs_stats.namespace_count);
+    } else {
+        ESP_LOGW("NVSDiag", "nvs_get_stats failed: %s", esp_err_to_name(nvs_stats_err));
+    }
+    {
+        Settings nvs_settings("reminder_tasks", false);
+        const std::string reminder_json = nvs_settings.GetString("tasks_v1");
+        ESP_LOGW("NVSDiag", "reminder_tasks/tasks_v1 size: %zu bytes", reminder_json.size());
+    }
+
 
     // The time zone has to be applied before the reminders are restored: the next daily/weekly
     // occurrence is computed from local time.
