@@ -61,7 +61,7 @@ struct ReminderTask {
  *  kPending -[trigger time reached]-> kDue -[MarkPlaying]-> kPlaying
  *  kPlaying -[OnPlaybackFinished(kSuccess)]-> kAwaitingResponse
  *  kAwaitingResponse -[explicit complete]-> kCompleted (one shot) / kPending (recurring)
- *  kAwaitingResponse -[snooze or no response]-> kDue (retried after a delay)
+ *  kAwaitingResponse -[snooze or response-processing timeout]-> kDue (retried after a delay)
  *  kPlaying -[OnPlaybackFinished(other)]-> kDue
  */
 class ReminderManager {
@@ -116,7 +116,8 @@ public:
     // Resolves the specified awaiting/paused reminder. Snooze returns it to due after delay_ms.
     bool ResolveReminderResponse(uint32_t id, bool completed, uint64_t delay_ms,
                                  std::string& out_error);
-    // A genuine response timeout increments retry_count; after two retries the task is paused.
+    // A response-processing timeout after detected user speech increments retry_count; after
+    // two retries the task is paused. Silence alone does not trigger a retry.
     bool RetryAwaitingResponse(uint32_t id, uint64_t delay_ms);
     // Defers an awaiting task after an infrastructure/listening failure without consuming a retry.
     bool DeferAwaitingResponse(uint32_t id, uint64_t delay_ms);
