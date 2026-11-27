@@ -1345,6 +1345,7 @@ void Application::StartListeningAudio() {
                      static_cast<unsigned long>(waiting.id));
         } else {
             reminder_response_listening_ = false;
+            reminder_response_resolution_pending_ = false;
             reminder_response_deadline_ms_ = 0;
         }
     }
