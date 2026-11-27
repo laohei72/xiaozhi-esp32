@@ -69,7 +69,7 @@ constexpr uint64_t kReminderRetryDelayMs = 30 * 1000;
 // The listening window is reopened after every assistant response, with no turn-count limit.
 constexpr uint64_t kReminderResponseProcessingTimeoutMs = 60 * 1000;
 // Temporary experiment: only reminder-response listening uses manual-stop mode.
-constexpr bool kUseManualStopForReminderResponse = true;
+constexpr bool kUseManualStopForReminderResponse = false;
 
 // Reminder schedule fields are local time, while the firmware clock is UTC until a zone is set (the
 // time itself comes from the OTA server, there is no SNTP client). The zone therefore comes from
@@ -173,6 +173,15 @@ void Application::Initialize() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_WAKE_WORD_DETECTED);
     };
     callbacks.on_vad_change = [this](bool speaking) {
+#ifdef REMINDER_RESPONSE_DIAG
+        if (reminder_response_listening_) {
+            if (speaking) {
+                reminder_response_vad_speaking_.store(true, std::memory_order_relaxed);
+            } else if (reminder_response_vad_speaking_.exchange(false, std::memory_order_relaxed)) {
+                ESP_LOGI(TAG, "Reminder response: local VAD detected end of speech (silence)");
+            }
+        }
+#endif
         xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
     };
     callbacks.on_playback_drained = [this]() {
@@ -1105,6 +1114,11 @@ void Application::HandleStopListeningEvent() {
         return;
     } else if (state == kDeviceStateListening) {
         if (protocol_) {
+#ifdef REMINDER_RESPONSE_DIAG
+            if (reminder_response_listening_) {
+                ESP_LOGI(TAG, "Reminder response: SendStopListening() invoked");
+            }
+#endif
             protocol_->SendStopListening();
         }
         SetDeviceState(kDeviceStateIdle);
@@ -1744,6 +1758,7 @@ void Application::StartReminderResponseListening() {
     reminder_response_deadline_ms_ = 0;
     reminder_response_resolution_pending_ = false;
 #ifdef REMINDER_RESPONSE_DIAG
+    reminder_response_vad_speaking_.store(false, std::memory_order_relaxed);
     reminder_audio_popped_ = reminder_audio_attempted_ = 0;
     reminder_audio_sent_ = reminder_audio_failed_ = reminder_audio_discarded_ = 0;
 #endif
