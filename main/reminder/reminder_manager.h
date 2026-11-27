@@ -99,7 +99,8 @@ public:
     bool TakeNextDueTask(ReminderTask& out);
 
     // kDue -> kPlaying, recording last_fired_unix.
-    void MarkPlaying(uint32_t id);
+    // Atomically claims a due task; false if it was cancelled, updated or claimed elsewhere.
+    bool MarkPlaying(uint32_t id);
 
     // Rolls kPlaying back to kDue so the task is retried on a later tick.
     void MarkPlaybackFailed(uint32_t id);
