@@ -65,9 +65,11 @@ STUBS = {
                 const auto it = store.find(ns_ + "/" + key);
                 return it == store.end() ? default_value : it->second;
             }
-            void SetString(const std::string& key, const std::string& value) {
+            bool SetString(const std::string& key, const std::string& value) {
                 store[ns_ + "/" + key] = value;
+                return true;
             }
+            bool Commit() { return true; }
             int32_t GetInt(const std::string& key, int32_t default_value = 0) {
                 const auto it = store.find(ns_ + "/" + key);
                 return it == store.end() ? default_value : std::atoi(it->second.c_str());

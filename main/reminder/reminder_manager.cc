@@ -353,7 +353,7 @@ static bool PruneAndSave(std::vector<ReminderTask>& tasks) {
             return false;
         }
         Settings settings(kNvsNamespace, true);
-        if (settings.SetString(kNvsKey, json)) {
+        if (settings.SetString(kNvsKey, json) && settings.Commit()) {
             return true;
         }
         // The write failed, most likely because the NVS partition is full: drop the oldest
