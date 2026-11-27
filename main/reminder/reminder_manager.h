@@ -36,6 +36,7 @@ struct ReminderTask {
     uint64_t trigger_ms = 0;         // 相对时间任务：esp_timer_get_time()/1000 + delay_ms
     int64_t trigger_unix = 0;        // 绝对/每天/每周：下次触发的 Unix 秒
     uint64_t created_ms = 0;         // 创建时的 esp_timer_get_time()/1000
+    uint64_t retry_not_before_ms = 0; // 仅运行期：超时/稍后提醒的重播门限，不写入 NVS
     int64_t last_fired_unix = 0;     // 最近一次触发完成的 Unix 秒，0 表示从未触发
     // 周期规则参数
     int daily_hour = 0;      // 0-23，kDaily 用
@@ -148,8 +149,6 @@ private:
     mutable std::mutex mutex_;
     std::vector<ReminderTask> tasks_;
     uint32_t next_id_ = 1;
-    // Runtime-only gate; a reboot replays an awaiting reminder instead of losing it.
-    uint64_t retry_not_before_ms_ = 0;
 };
 
 #endif  // REMINDER_MANAGER_H_
