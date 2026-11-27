@@ -581,6 +581,7 @@ void AfeAudioEngine::EncodeWakeWordData() {
     wake_word_encode_task_ = xTaskCreateStatic(
         [](void* arg) {
             auto* engine = static_cast<AfeAudioEngine*>(arg);
+            const uint32_t cache_generation = engine->wake_word_cache_generation_.load();
             auto start_time = esp_timer_get_time();
             esp_opus_enc_config_t opus_enc_cfg = AS_OPUS_ENC_CONFIG();
             void* encoder_handle = nullptr;
@@ -588,7 +589,9 @@ void AfeAudioEngine::EncodeWakeWordData() {
                 esp_opus_enc_open(&opus_enc_cfg, sizeof(esp_opus_enc_config_t), &encoder_handle);
             if (encoder_handle == nullptr) {
                 ESP_LOGE(TAG, "Failed to create wake-word encoder: %d", ret);
-                engine->wake_word_audio_cache_.Clear();
+                if (cache_generation == engine->wake_word_cache_generation_.load()) {
+                    engine->wake_word_audio_cache_.Clear();
+                }
                 {
                     std::lock_guard<std::mutex> lock(engine->wake_word_mutex_);
                     engine->wake_word_opus_.emplace_back();
@@ -607,7 +610,6 @@ void AfeAudioEngine::EncodeWakeWordData() {
             esp_audio_enc_in_frame_t in = {};
             esp_audio_enc_out_frame_t out = {};
 
-            const uint32_t cache_generation = engine->wake_word_cache_generation_.load();
             const size_t cached_samples = engine->wake_word_audio_cache_.Size();
             for (size_t offset = 0; offset + static_cast<size_t>(frame_size) <= cached_samples;
                  offset += frame_size) {
