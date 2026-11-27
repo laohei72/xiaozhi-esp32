@@ -642,22 +642,23 @@ bool ReminderManager::TakeNextDueTask(ReminderTask& out) {
     return true;
 }
 
-void ReminderManager::MarkPlaying(uint32_t id) {
+bool ReminderManager::MarkPlaying(uint32_t id) {
     std::lock_guard<std::mutex> lock(mutex_);
     ReminderTask* task = FindLocked(id);
     if (task == nullptr) {
         ESP_LOGW(TAG, "Reminder %u no longer exists, cannot start playing it", id);
-        return;
+        return false;
     }
     if (task->state != ReminderState::kDue) {
         ESP_LOGW(TAG, "Reminder %u is %s, not starting it", id, StateName(task->state));
-        return;
+        return false;
     }
     task->state = ReminderState::kPlaying;
     const int64_t now_unix = NowUnixSeconds();
     if (now_unix > kMinTrustedUnix) task->last_fired_unix = now_unix;
     SaveLocked();
     ESP_LOGI(TAG, "Reminder %u is playing", id);
+    return true;
 }
 
 void ReminderManager::MarkPlaybackFailed(uint32_t id) {
