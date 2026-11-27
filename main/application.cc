@@ -781,6 +781,7 @@ void Application::InitializeProtocol() {
                                 reminder_response_listening_ = false;
                                 reminder_response_deadline_ms_ = 0;
                                 SetDeviceState(kDeviceStateIdle);
+                                Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
                             }
                         } else if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
