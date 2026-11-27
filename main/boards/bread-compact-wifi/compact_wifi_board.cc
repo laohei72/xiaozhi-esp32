@@ -183,6 +183,7 @@ Application::GetInstance().StartProactiveGreeting();
             auto& audio = Application::GetInstance().GetAudioService();
             const bool muted = !audio.IsMicrophoneMuted();
             audio.SetMicrophoneMuted(muted);
+            GetLed()->SetMicrophoneMuted(muted);
             GetDisplay()->ShowNotification(muted ? "麦克风已静音" : "麦克风已恢复");
         });
 
