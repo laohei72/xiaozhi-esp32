@@ -175,6 +175,12 @@ private:
     uint64_t reminder_response_deadline_ms_ = 0;
     bool reminder_response_listening_ = false;
     bool reminder_response_resolution_pending_ = false;
+    // Temporary diagnostics for reminder-response microphone uplink (10-second windows).
+    uint32_t reminder_audio_popped_ = 0;
+    uint32_t reminder_audio_attempted_ = 0;
+    uint32_t reminder_audio_sent_ = 0;
+    uint32_t reminder_audio_failed_ = 0;
+    uint32_t reminder_audio_discarded_ = 0;
     // Server Opus frames dropped while a PCM session owned the playback path (§9.5).
     std::atomic<uint32_t> pcm_tts_dropped_packets_{0};
     std::unique_ptr<Ota> ota_;
