@@ -312,6 +312,14 @@ bool ReminderManager::LoadLocked() {
     return true;
 }
 
+// Keep the persisted state compatible with the stable firmware: an unresolved response is
+// stored as "playing", which older firmware already recovers as due after reboot. The model-facing
+// task list still exposes the richer "awaiting_response" runtime state through StateName().
+static const char* StoredStateName(ReminderState state) {
+    return state == ReminderState::kAwaitingResponse ? "playing"
+                                                      : ReminderManager::StateName(state);
+}
+
 // Serializes tasks_ to JSON. Returns false on allocation or serialization failure.
 static bool BuildTasksJson(const std::vector<ReminderTask>& tasks, std::string& out) {
     CJsonUniquePtr root(cJSON_CreateObject());
@@ -324,7 +332,7 @@ static bool BuildTasksJson(const std::vector<ReminderTask>& tasks, std::string& 
         cJSON_AddNumberToObject(item.get(), "id", task.id);
         cJSON_AddStringToObject(item.get(), "text", task.text.c_str());
         cJSON_AddStringToObject(item.get(), "type", ReminderManager::TypeName(task.type));
-        cJSON_AddStringToObject(item.get(), "state", ReminderManager::StateName(task.state));
+        cJSON_AddStringToObject(item.get(), "state", StoredStateName(task.state));
         cJSON_AddBoolToObject(item.get(), "recurring_active", task.recurring_active);
         cJSON_AddNumberToObject(item.get(), "trigger_ms", static_cast<double>(task.trigger_ms));
         cJSON_AddNumberToObject(item.get(), "trigger_unix", static_cast<double>(task.trigger_unix));
