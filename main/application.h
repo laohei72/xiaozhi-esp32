@@ -170,6 +170,9 @@ private:
     // Monotonic deadline (ms) before which a reminder whose utterance failed or was interrupted is
     // not retried, so a barge-in does not replay the task on the very next tick.
     uint64_t reminder_retry_not_before_ms_ = 0;
+    // The local reminder has finished speaking; this window listens for an explicit response.
+    uint64_t reminder_response_deadline_ms_ = 0;
+    bool reminder_response_listening_ = false;
     // Server Opus frames dropped while a PCM session owned the playback path (§9.5).
     std::atomic<uint32_t> pcm_tts_dropped_packets_{0};
     std::unique_ptr<Ota> ota_;
@@ -219,6 +222,7 @@ private:
     void HandleReminderTick();
     // Starts the PCM utterance that speaks |task|; returns false when it could not be started.
     bool StartReminderPlayback(const ReminderTask& task);
+    void StartReminderResponseListening();
 
     // Activation task (runs in background)
     void ActivationTask();
