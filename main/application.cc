@@ -1570,6 +1570,7 @@ void Application::HandleReminderTick() {
 bool Application::StartReminderPlayback(const ReminderTask& task) {
     const uint32_t id = task.id;
     const std::string text = task.text;
+    pcm_tts_reminder_text_ = text;
     ESP_LOGI(TAG, "Speaking reminder %lu", static_cast<unsigned long>(id));
 
     // Claim the task before any I/O: TakeNextDueTask() is read-only, so this is what keeps the next
@@ -1587,6 +1588,7 @@ bool Application::StartReminderPlayback(const ReminderTask& task) {
                             std::move(prepare), std::move(close))) {
         // Nothing was started, so hand the task back: it stays due and is retried on a later tick
         // instead of being dropped.
+        pcm_tts_reminder_text_.clear();
         reminder_manager_.MarkPlaybackFailed(id);
         reminder_retry_not_before_ms_ = NowMonotonicMs() + kReminderRetryDelayMs;
         ESP_LOGW(TAG, "Failed to start reminder %lu playback", static_cast<unsigned long>(id));
@@ -1622,19 +1624,40 @@ void Application::HandlePcmTtsFinished(uint32_t session_id, PcmTtsPlayer::Error 
             ESP_LOGW(TAG, "PCM TTS session %lu finished with %s",
                      static_cast<unsigned long>(session_id), PcmTtsPlayer::GetErrorName(error));
         }
+
+        std::string reminder_context;
         if (reminder_id != 0) {
-            // Only kSuccess completes or reschedules the task; anything else keeps it retryable, and
-            // the gate below delays that retry so a barge-in does not replay the task immediately.
-            reminder_manager_.OnPlaybackFinished(reminder_id, error);
-            if (error != PcmTtsPlayer::Error::kSuccess) {
+            if (error == PcmTtsPlayer::Error::kSuccess) {
+                // Stage-one test only: keep the manager's task in kPlaying and ask the server
+                // to continue the interaction with the reminder id and text as context.
+                pending_reminder_confirmation_id_ = reminder_id;
+                reminder_context = "提醒 #" + std::to_string(reminder_id) + "：" +
+                                   pcm_tts_reminder_text_ +
+                                   "。请问这件事已经完成了吗？如果已经完成，请调用 "
+                                   "self.reminders.resolve，action 填 completed；如果需要稍后处理，"
+                                   "请根据用户指定的时间调用该工具，action 填 snooze；如果用户不再"
+                                   "需要提醒，请调用该工具，action 填 cancel。调用工具时必须传回"
+                                   "提醒编号。";
+                ESP_LOGI(TAG, "Reminder %lu playback finished; starting contextual follow-up",
+                         static_cast<unsigned long>(reminder_id));
+            } else {
+                // Preserve the established retry behavior for interrupted or failed playback.
+                reminder_manager_.OnPlaybackFinished(reminder_id, error);
                 reminder_retry_not_before_ms_ = NowMonotonicMs() + kReminderRetryDelayMs;
             }
         }
+        pcm_tts_reminder_text_.clear();
+
         Board::GetInstance().GetDisplay()->SetChatMessage("assistant", "");
         if (GetDeviceState() == kDeviceStateSpeaking) {
             SetDeviceState(kDeviceStateIdle);
         }
         Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+
+        // Start only after the PCM session is detached and the device is idle.
+        if (!reminder_context.empty()) {
+            StartProactiveGreeting(reminder_context);
+        }
     });
 }
 
@@ -1740,23 +1763,28 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
     }
 }
 
-void Application::StartProactiveGreeting() {
+void Application::StartProactiveGreeting(const std::string& context) {
+    std::string wake_text = context;
+    if (wake_text.empty()) {
+#if defined(CONFIG_CUSTOM_WAKE_WORD_DISPLAY)
+        wake_text = CONFIG_CUSTOM_WAKE_WORD_DISPLAY;
+#else
+        wake_text = "小智你好呀";
+#endif
+    }
+
     // Button and PIR callbacks can run outside the main task; serialize on the main event loop.
-    Schedule([this]() {
+    // Capture by value: Schedule executes asynchronously after this function has returned.
+    Schedule([this, wake_text]() {
         if (!protocol_ || GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy() ||
             pcm_tts_player_.IsBusy() || !audio_service_.IsPlaybackIdle()) {
             ESP_LOGD(TAG, "Ignoring proactive greeting while device is busy");
             return;
         }
 #if defined(CONFIG_SEND_WAKE_WORD_DATA) && CONFIG_SEND_WAKE_WORD_DATA
-#if defined(CONFIG_CUSTOM_WAKE_WORD_DISPLAY)
-        const std::string greeting = CONFIG_CUSTOM_WAKE_WORD_DISPLAY;
-#else
-        const std::string greeting = "小智你好呀";
-#endif
-        ESP_LOGI(TAG, "Starting proactive greeting: %s", greeting.c_str());
-        // Kconfig describes CUSTOM_WAKE_WORD_DISPLAY as the greeting sent to the server.
-        BeginWakeWordInvoke(greeting);
+        ESP_LOGI(TAG, "Starting proactive interaction: %s", wake_text.c_str());
+        // The server receives the supplied context through the existing wake-word invocation path.
+        BeginWakeWordInvoke(wake_text);
 #else
         ESP_LOGW(TAG, "Proactive greeting requires SEND_WAKE_WORD_DATA to be enabled");
 #endif
