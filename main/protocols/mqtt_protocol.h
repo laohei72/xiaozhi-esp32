@@ -76,6 +76,13 @@ private:
     std::atomic<bool> awaiting_hello_{false};
     std::atomic<bool> hello_valid_{false};
 
+    // Temporary raw UDP audio-send diagnostics; removed with REMINDER_RESPONSE_DIAG.
+    uint32_t audio_udp_send_calls_ = 0;
+    uint32_t audio_udp_send_positive_ = 0;
+    uint32_t audio_udp_send_nonpositive_ = 0;
+    long audio_udp_last_send_result_ = 0;
+    int64_t audio_udp_stats_window_start_us_ = 0;
+
     void ArmProbeTimer(int64_t due);
     void ReceivePong(const std::shared_ptr<ProbeChannel>& channel, const std::string& data);
 
