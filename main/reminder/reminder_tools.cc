@@ -283,7 +283,7 @@ void RegisterReminderTools(ReminderManager& manager) {
         "`next_trigger_local` shows when its next run is due in the device's local time. Use it "
         "before creating an absolute/daily/weekly reminder, and before cancelling or changing one. "
         "After the device speaks a reminder, check for a task in `awaiting_response` state before "
-        "interpreting the user's next utterance; that utterance may be a confirmation, a snooze "
+        "interpreting the user's next utterance, even when it is short (such as `好的` or `知道了`); it may be a confirmation, a snooze "
         "request, or a question about the reminder.",
         PropertyList(), [&manager](const PropertyList&) -> ToolResult {
             const auto tasks = manager.ListReminders();
@@ -325,7 +325,7 @@ void RegisterReminderTools(ReminderManager& manager) {
         "Resolve the reminder that is currently awaiting the user's response. First call "
         "`self.reminders.list` and confirm there is exactly one task with state "
         "`awaiting_response`. Call this tool with action `complete` ONLY when the user "
-        "clearly confirms the reminder has been handled (for example, 'done', 'I did it'). "
+        "clearly confirms the reminder has been handled (for example, 'done', 'I did it', or Chinese '已经处理了'). '好的' or '知道了' alone are NOT confirmation. "
         "Call it with action `snooze` when the user explicitly asks to be reminded later; "
         "set `delay_seconds` to the requested delay (use 300 seconds for an unspecified "
         "short delay). If the user asks what the reminder means, asks a question, discusses "
