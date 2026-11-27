@@ -16,6 +16,7 @@
 
 #include <driver/gpio.h>
 #include <esp_log.h>
+#include <nvs.h>
 #include <nvs_flash.h>
 #include <esp_partition.h>
 #include <arpa/inet.h>
@@ -24,6 +25,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <vector>
 
 #define TAG "Application"
 
@@ -86,6 +89,114 @@ uint64_t NowMonotonicMs() {
     return static_cast<uint64_t>(esp_timer_get_time()) / 1000;
 }
 
+
+struct NvsKeyInfo {
+    std::string key;
+    nvs_type_t type;
+};
+
+// Temporary, read-only inventory of the default NVS partition.
+// Remove this helper and its call after collecting one boot log.
+void DumpNvsUsage() {
+    std::map<std::string, std::vector<NvsKeyInfo>> by_ns;
+    nvs_iterator_t it = nullptr;
+    esp_err_t res = nvs_entry_find("nvs", nullptr, NVS_TYPE_ANY, &it);
+
+    while (res == ESP_OK) {
+        nvs_entry_info_t info = {};
+        const esp_err_t info_res = nvs_entry_info(it, &info);
+        if (info_res != ESP_OK) {
+            ESP_LOGW("NVSDiag", "nvs_entry_info failed: %s",
+                     esp_err_to_name(info_res));
+            break;
+        }
+        by_ns[info.namespace_name].push_back({info.key, info.type});
+        res = nvs_entry_next(&it);
+    }
+
+    if (res != ESP_OK && res != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW("NVSDiag", "entry enumeration failed: %s", esp_err_to_name(res));
+    }
+    // nvs_entry_next() nulls the iterator at end-of-enumeration; this is safe either way.
+    nvs_release_iterator(it);
+
+    ESP_LOGW("NVSDiag", "== per-namespace keys ==");
+    for (const auto& ns_entry : by_ns) {
+        const auto& ns = ns_entry.first;
+        const auto& keys = ns_entry.second;
+        nvs_handle_t handle = 0;
+        const esp_err_t open_res =
+            nvs_open_from_partition("nvs", ns.c_str(), NVS_READONLY, &handle);
+        if (open_res != ESP_OK) {
+            ESP_LOGW("NVSDiag", "ns=%s open failed: %s", ns.c_str(),
+                     esp_err_to_name(open_res));
+            continue;
+        }
+
+        ESP_LOGW("NVSDiag", "ns=%s keys=%u", ns.c_str(),
+                 static_cast<unsigned>(keys.size()));
+        for (const auto& key : keys) {
+            const char* type_name = "unknown";
+            size_t len = 0;
+            bool has_length = false;
+            esp_err_t len_res = ESP_OK;
+
+            switch (key.type) {
+                case NVS_TYPE_STR:
+                    type_name = "str";
+                    has_length = true;
+                    len_res = nvs_get_str(handle, key.key.c_str(), nullptr, &len);
+                    break;
+                case NVS_TYPE_BLOB:
+                    type_name = "blob";
+                    has_length = true;
+                    len_res = nvs_get_blob(handle, key.key.c_str(), nullptr, &len);
+                    break;
+                case NVS_TYPE_U8: type_name = "u8"; break;
+                case NVS_TYPE_I8: type_name = "i8"; break;
+                case NVS_TYPE_U16: type_name = "u16"; break;
+                case NVS_TYPE_I16: type_name = "i16"; break;
+                case NVS_TYPE_U32: type_name = "u32"; break;
+                case NVS_TYPE_I32: type_name = "i32"; break;
+                case NVS_TYPE_U64: type_name = "u64"; break;
+                case NVS_TYPE_I64: type_name = "i64"; break;
+                case NVS_TYPE_FLOAT: type_name = "float"; break;
+                case NVS_TYPE_DOUBLE: type_name = "double"; break;
+                default: break;
+            }
+
+            if (has_length) {
+                if (len_res == ESP_OK) {
+                    // For strings, nvs_get_str() reports the required size including the
+                    // terminating NUL. Blob lengths are exact payload bytes.
+                    ESP_LOGW("NVSDiag", "  %s type=%s len_bytes=%u",
+                             key.key.c_str(), type_name, static_cast<unsigned>(len));
+                } else {
+                    ESP_LOGW("NVSDiag", "  %s type=%s len_query_failed=%s",
+                             key.key.c_str(), type_name, esp_err_to_name(len_res));
+                }
+            } else {
+                ESP_LOGW("NVSDiag", "  %s type=%s", key.key.c_str(), type_name);
+            }
+        }
+        nvs_close(handle);
+    }
+
+    nvs_stats_t stats = {};
+    const esp_err_t stats_res = nvs_get_stats("nvs", &stats);
+    if (stats_res == ESP_OK) {
+        ESP_LOGW("NVSDiag",
+                 "== global: used=%u free=%u available=%u total=%u namespaces=%u ==",
+                 static_cast<unsigned>(stats.used_entries),
+                 static_cast<unsigned>(stats.free_entries),
+                 static_cast<unsigned>(stats.available_entries),
+                 static_cast<unsigned>(stats.total_entries),
+                 static_cast<unsigned>(stats.namespace_count));
+    } else {
+        ESP_LOGW("NVSDiag", "nvs_get_stats failed: %s", esp_err_to_name(stats_res));
+    }
+}
+
 }  // namespace
 
 Application::Application()
@@ -136,38 +247,13 @@ bool Application::SetDeviceState(DeviceState state) { return state_machine_.Tran
 void Application::Initialize() {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
-    const esp_partition_t* nvs_partition = esp_partition_find_first(
-        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_NVS, "nvs");
-    if (nvs_partition != nullptr) {
-        ESP_LOGW("NVSDiag", "partition: label=%s address=0x%08lx size=%lu bytes",
-                 nvs_partition->label, static_cast<unsigned long>(nvs_partition->address),
-                 static_cast<unsigned long>(nvs_partition->size));
-    } else {
-        ESP_LOGW("NVSDiag", "default NVS partition not found");
-    }
-    // Temporary, read-only NVS snapshot. Remove after collecting one boot log.
-    nvs_stats_t nvs_stats = {};
-    esp_err_t nvs_stats_err = nvs_get_stats(nullptr, &nvs_stats);
-    if (nvs_stats_err == ESP_OK) {
-        ESP_LOGW("NVSDiag", "entries: used=%zu free=%zu available=%zu total=%zu namespaces=%zu",
-                 nvs_stats.used_entries, nvs_stats.free_entries, nvs_stats.available_entries,
-                 nvs_stats.total_entries, nvs_stats.namespace_count);
-    } else {
-        ESP_LOGW("NVSDiag", "nvs_get_stats failed: %s", esp_err_to_name(nvs_stats_err));
-    }
-    {
-        Settings nvs_settings("reminder_tasks", false);
-        const std::string reminder_json = nvs_settings.GetString("tasks_v1");
-        ESP_LOGW("NVSDiag", "reminder_tasks/tasks_v1 size: %zu bytes", reminder_json.size());
-    }
-
-
     // The time zone has to be applied before the reminders are restored: the next daily/weekly
     // occurrence is computed from local time.
     ApplyReminderTimeZone();
     // Restore the stored reminders before the first clock tick can play one, so a task that expired
     // while the device was off is settled exactly once, at boot.
     reminder_manager_.Init();
+    DumpNvsUsage();
 
     // Setup the display
     auto display = board.GetDisplay();
