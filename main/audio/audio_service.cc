@@ -854,7 +854,7 @@ void AudioService::SetMicrophoneMuted(bool muted) {
         audio_queue_cv_.notify_all();
     }
     if (audio_engine_initialized_ && audio_engine_ != nullptr) {
-        audio_engine_->ClearWakeWordData();
+        audio_engine_->ClearBufferedAudio();
     }
     if (!muted) {
         // Discard resampler history and the first input interval after I2S RX is restarted.
