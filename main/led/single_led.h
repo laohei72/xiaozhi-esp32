@@ -16,12 +16,14 @@ public:
     virtual ~SingleLed();
 
     void OnStateChanged() override;
+    void SetMicrophoneMuted(bool muted) override;
 
 private:
     std::mutex mutex_;
     TaskHandle_t blink_task_ = nullptr;
     led_strip_handle_t led_strip_ = nullptr;
     uint8_t r_ = 0, g_ = 0, b_ = 0;
+    std::atomic<bool> microphone_muted_{false};
     int blink_counter_ = 0;
     int blink_interval_ms_ = 0;
     esp_timer_handle_t blink_timer_ = nullptr;
