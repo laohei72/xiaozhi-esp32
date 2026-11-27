@@ -120,7 +120,18 @@ void SingleLed::OnBlinkTimer() {
 }
 
 
+void SingleLed::SetMicrophoneMuted(bool muted) {
+    microphone_muted_.store(muted);
+    OnStateChanged();
+}
+
 void SingleLed::OnStateChanged() {
+    if (microphone_muted_.load()) {
+        SetColor(HIGH_BRIGHTNESS, 0, 0);
+        TurnOn();
+        return;
+    }
+
     auto& app = Application::GetInstance();
     auto device_state = app.GetDeviceState();
     switch (device_state) {
