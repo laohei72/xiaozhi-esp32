@@ -635,11 +635,10 @@ size_t ReminderManager::MarkDueTasks() {
 
 bool ReminderManager::TakeNextDueTask(ReminderTask& out) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (NowMonotonicMs() < retry_not_before_ms_) return false;
-    retry_not_before_ms_ = 0;
+    const uint64_t now_ms = NowMonotonicMs();
     const ReminderTask* next = nullptr;
     for (const auto& task : tasks_) {
-        if (task.state != ReminderState::kDue) continue;
+        if (task.state != ReminderState::kDue || task.retry_not_before_ms > now_ms) continue;
         if (next == nullptr || task.id < next->id) next = &task;
     }
     if (next == nullptr) return false;
@@ -747,7 +746,7 @@ bool ReminderManager::ResolveAwaitingResponse(bool completed, uint64_t delay_ms,
             return false;
         }
         task->state = ReminderState::kDue;
-        retry_not_before_ms_ = NowMonotonicMs() + delay_ms;
+        task->retry_not_before_ms = NowMonotonicMs() + delay_ms;
         ESP_LOGI(TAG, "Reminder %u snoozed", task->id);
     } else if (IsRecurring(task->type)) {
         const int64_t after = task->last_fired_unix > 0 ? task->last_fired_unix : NowUnixSeconds();
@@ -777,7 +776,7 @@ bool ReminderManager::RetryAwaitingResponse(uint32_t id, uint64_t delay_ms) {
     const uint64_t now = NowMonotonicMs();
     if (delay_ms > UINT64_MAX - now) return false;
     task->state = ReminderState::kDue;
-    retry_not_before_ms_ = now + delay_ms;
+    task->retry_not_before_ms = now + delay_ms;
     SaveLocked();
     ESP_LOGI(TAG, "Reminder %u response timed out; retry scheduled", id);
     return true;
