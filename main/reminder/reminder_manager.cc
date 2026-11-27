@@ -375,7 +375,7 @@ static bool PruneAndSave(std::vector<ReminderTask>& tasks) {
             ESP_LOGE(TAG, "Failed to persist reminders: storage error and no finished task can be pruned");
             return false;
         }
-        ESP_LOGW(TAG, "NVS full, dropping finished reminder %u to free space",
+        ESP_LOGW(TAG, "Persistence retry: dropping finished reminder %u to free space",
                  static_cast<unsigned>(victim->id));
         tasks.erase(victim);
     }
@@ -400,7 +400,6 @@ void ReminderManager::Init() {
     const uint64_t now_ms = NowMonotonicMs();
     const bool time_synced = IsSystemTimeSynced();
     const int64_t now_unix = time_synced ? NowUnixSeconds() : 0;
-    const std::vector<ReminderTask> before_cancel_all = tasks_;
     bool changed = false;
     for (auto& task : tasks_) {
         if (task.state == ReminderState::kPlaying) {
@@ -605,6 +604,7 @@ bool ReminderManager::CancelReminder(uint32_t id, std::string& out_error) {
 bool ReminderManager::CancelAll(std::string& out_error) {
     out_error.clear();
     std::lock_guard<std::mutex> lock(mutex_);
+    const std::vector<ReminderTask> before_cancel_all = tasks_;
     bool changed = false;
     for (auto& task : tasks_) {
         if (task.state == ReminderState::kCancelled) continue;
