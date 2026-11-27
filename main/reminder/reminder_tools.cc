@@ -334,7 +334,7 @@ void RegisterReminderTools(ReminderManager& manager) {
         "speech as completion. This tool acts only on the sole active awaiting-response task.",
         PropertyList({
             Property("action", kPropertyTypeString),
-            Property("delay_seconds", kPropertyTypeInteger, 300, 60, 7 * 24 * 60 * 60),
+            Property("delay_seconds", kPropertyTypeInteger, 300, 1, 7 * 24 * 60 * 60),
         }),
         [&manager](const PropertyList& properties) -> ToolResult {
             const std::string action = properties["action"].value<std::string>();
