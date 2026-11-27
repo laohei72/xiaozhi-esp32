@@ -17,6 +17,7 @@
 #include <driver/gpio.h>
 #include <esp_log.h>
 #include <nvs_flash.h>
+#include <esp_partition.h>
 #include <arpa/inet.h>
 #include <cJSON.h>
 #include <algorithm>
@@ -135,6 +136,15 @@ bool Application::SetDeviceState(DeviceState state) { return state_machine_.Tran
 void Application::Initialize() {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
+    const esp_partition_t* nvs_partition = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_NVS, "nvs");
+    if (nvs_partition != nullptr) {
+        ESP_LOGW("NVSDiag", "partition: label=%s address=0x%08lx size=%lu bytes",
+                 nvs_partition->label, static_cast<unsigned long>(nvs_partition->address),
+                 static_cast<unsigned long>(nvs_partition->size));
+    } else {
+        ESP_LOGW("NVSDiag", "default NVS partition not found");
+    }
     // Temporary, read-only NVS snapshot. Remove after collecting one boot log.
     nvs_stats_t nvs_stats = {};
     esp_err_t nvs_stats_err = nvs_get_stats(nullptr, &nvs_stats);
