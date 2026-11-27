@@ -32,6 +32,8 @@ private:
     Button touch_button_;
     Button volume_up_button_;
     Button volume_down_button_;
+    Button function_button_;
+    Button mic_mute_button_;
     esp_timer_handle_t pir_poll_timer_ = nullptr;
     int pir_last_level_ = 0;
     int64_t pir_high_since_us_ = 0;
@@ -161,6 +163,24 @@ Application::GetInstance().StartProactiveGreeting();
     }
 
     void InitializeButtons() {
+        function_button_.OnClick([this]() {
+            // A short press manually starts the normal wake-word interaction.
+            Application::GetInstance().WakeWordInvoke("小智小智");
+        });
+        function_button_.OnDoubleClick([this]() {
+            ReconnectWifi();
+        });
+        function_button_.OnLongPress([this]() {
+            EnterWifiConfigMode();
+        });
+
+        mic_mute_button_.OnClick([this]() {
+            auto& audio = Application::GetInstance().GetAudioService();
+            const bool muted = !audio.IsMicrophoneMuted();
+            audio.SetMicrophoneMuted(muted);
+            GetDisplay()->ShowNotification(muted ? "麦克风已静音" : "麦克风已恢复");
+        });
+
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
@@ -227,7 +247,9 @@ public:
         boot_button_(BOOT_BUTTON_GPIO, false, 2000),
         touch_button_(TOUCH_BUTTON_GPIO),
         volume_up_button_(VOLUME_UP_BUTTON_GPIO),
-        volume_down_button_(VOLUME_DOWN_BUTTON_GPIO) {
+        volume_down_button_(VOLUME_DOWN_BUTTON_GPIO),
+        function_button_(FUNCTION_BUTTON_GPIO, false, 2000),
+        mic_mute_button_(MIC_MUTE_BUTTON_GPIO) {
         InitializeDisplayI2c();
         InitializeSsd1306Display();
         InitializeButtons();
