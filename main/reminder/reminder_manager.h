@@ -22,6 +22,7 @@ enum class ReminderState {
     kPending,    // 等待执行（未到期）
     kDue,        // 已到期，等待播放
     kPlaying,    // 正在播放
+    kAwaitingResponse, // 播报完成，等待用户明确回应
     kCompleted,  // 已完成
     kCancelled,  // 已取消
 };
@@ -55,8 +56,10 @@ struct ReminderTask {
  *
  * State transitions:
  *  kPending -[trigger time reached]-> kDue -[MarkPlaying]-> kPlaying
- *  kPlaying -[OnPlaybackFinished(kSuccess)]-> kCompleted (one shot) / kPending (recurring)
- *  kPlaying -[OnPlaybackFinished(other)]-> kDue (one shot) / kPending (recurring)
+ *  kPlaying -[OnPlaybackFinished(kSuccess)]-> kAwaitingResponse
+ *  kAwaitingResponse -[explicit complete]-> kCompleted (one shot) / kPending (recurring)
+ *  kAwaitingResponse -[snooze or no response]-> kDue (retried after a delay)
+ *  kPlaying -[OnPlaybackFinished(other)]-> kDue
  */
 class ReminderManager {
 public:
@@ -104,9 +107,13 @@ public:
     // Rolls kPlaying back to kDue so the task is retried on a later tick.
     void MarkPlaybackFailed(uint32_t id);
 
-    // Applies the playback outcome: kSuccess completes a one-shot task or schedules the next run of
-    // a recurring one; kCancelled and every other error keep the task retryable.
+    // A successful utterance starts a response window; it does not complete the reminder.
     void OnPlaybackFinished(uint32_t id, PcmTtsPlayer::Error error);
+    bool GetAwaitingResponseTask(ReminderTask& out) const;
+    // Resolves the sole reminder awaiting a response. Snooze returns it to due after delay_ms.
+    bool ResolveAwaitingResponse(bool completed, uint64_t delay_ms, std::string& out_error);
+    // No response (or an interrupted response window): retry the reminder after delay_ms.
+    bool RetryAwaitingResponse(uint32_t id, uint64_t delay_ms);
 
     // "pending"/"due"/"playing"/"completed"/"cancelled".
     static const char* StateName(ReminderState state);
@@ -141,6 +148,8 @@ private:
     mutable std::mutex mutex_;
     std::vector<ReminderTask> tasks_;
     uint32_t next_id_ = 1;
+    // Runtime-only gate; a reboot replays an awaiting reminder instead of losing it.
+    uint64_t retry_not_before_ms_ = 0;
 };
 
 #endif  // REMINDER_MANAGER_H_
