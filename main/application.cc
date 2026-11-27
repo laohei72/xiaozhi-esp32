@@ -1208,6 +1208,9 @@ void Application::HandleStateChangedEvent() {
     auto display = board.GetDisplay();
     auto led = board.GetLed();
     led->OnStateChanged();
+    if (new_state != kDeviceStateSpeaking && reminder_chime_pending_) {
+        reminder_chime_start_pending_ = false;
+    }
 
     switch (new_state) {
         case kDeviceStateUnknown:
