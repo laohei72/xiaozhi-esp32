@@ -552,7 +552,10 @@ void AfeAudioEngine::EncodeWakeWordData() {
     }
 
     const size_t stack_size = 4096 * 6;
-    wake_word_opus_.clear();
+    {
+        std::lock_guard<std::mutex> lock(wake_word_mutex_);
+        wake_word_opus_.clear();
+    }
     if (wake_word_encode_task_stack_ == nullptr) {
         wake_word_encode_task_stack_ =
             static_cast<StackType_t*>(heap_caps_malloc(stack_size, MALLOC_CAP_SPIRAM));
