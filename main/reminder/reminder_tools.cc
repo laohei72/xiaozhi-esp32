@@ -281,7 +281,10 @@ void RegisterReminderTools(ReminderManager& manager) {
         "List the reminders stored on the device and report the device clock (`now_unix`, "
         "`now_local`). `remaining_seconds` counts down a relative reminder and "
         "`next_trigger_local` shows when its next run is due in the device's local time. Use it "
-        "before creating an absolute/daily/weekly reminder, and before cancelling or changing one.",
+        "before creating an absolute/daily/weekly reminder, and before cancelling or changing one. "
+        "After the device speaks a reminder, check for a task in `awaiting_response` state before "
+        "interpreting the user's next utterance; that utterance may be a confirmation, a snooze "
+        "request, or a question about the reminder.",
         PropertyList(), [&manager](const PropertyList&) -> ToolResult {
             const auto tasks = manager.ListReminders();
             CJsonUniquePtr root(cJSON_CreateObject());
@@ -315,6 +318,36 @@ void RegisterReminderTools(ReminderManager& manager) {
             }
             array.release();
             return root.release();
+        });
+
+    mcp_server.AddTool(
+        "self.reminders.respond",
+        "Resolve the reminder that is currently awaiting the user's response. First call "
+        "`self.reminders.list` and confirm there is exactly one task with state "
+        "`awaiting_response`. Call this tool with action `complete` ONLY when the user "
+        "clearly confirms the reminder has been handled (for example, 'done', 'I did it'). "
+        "Call it with action `snooze` when the user explicitly asks to be reminded later; "
+        "set `delay_seconds` to the requested delay (use 300 seconds for an unspecified "
+        "short delay). If the user asks what the reminder means, asks a question, discusses "
+        "it, or gives an unclear response, DO NOT call this tool: answer and continue the "
+        "conversation, leaving the reminder awaiting a response. Never treat any arbitrary "
+        "speech as completion. This tool acts only on the sole active awaiting-response task.",
+        PropertyList({
+            Property("action", kPropertyTypeString),
+            Property("delay_seconds", kPropertyTypeInteger, 300, 60, 7 * 24 * 60 * 60),
+        }),
+        [&manager](const PropertyList& properties) -> ToolResult {
+            const std::string action = properties["action"].value<std::string>();
+            if (action != "complete" && action != "snooze") {
+                return std::unexpected("action must be complete or snooze");
+            }
+            const uint64_t delay_ms =
+                static_cast<uint64_t>(properties["delay_seconds"].value<int>()) * 1000;
+            std::string error;
+            if (!manager.ResolveAwaitingResponse(action == "complete", delay_ms, error)) {
+                return std::unexpected(error);
+            }
+            return true;
         });
 
     mcp_server.AddTool(
