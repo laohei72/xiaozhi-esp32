@@ -1799,6 +1799,10 @@ void Application::StartProactiveGreeting() {
 }
 
 void Application::WakeWordInvoke(const std::string& wake_word) {
+    if (audio_service_.IsMicrophoneMuted()) {
+        ESP_LOGW(TAG, "Ignoring manual wake invocation while microphone is muted");
+        return;
+    }
     if (!protocol_) {
         return;
     }
