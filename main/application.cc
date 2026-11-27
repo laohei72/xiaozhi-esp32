@@ -1796,14 +1796,9 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
 }
 
 void Application::StartProactiveGreeting() {
-#if defined(CONFIG_CUSTOM_WAKE_WORD_DISPLAY)
-    const std::string wake_word = CONFIG_CUSTOM_WAKE_WORD_DISPLAY;
-#else
-    const std::string wake_word = "小智小智";
-#endif
     // PIR and board callbacks may run outside the main task. Only start a proactive
     // interaction when the device is truly idle; motion must never interrupt a user.
-    Schedule([this, wake_word]() {
+    Schedule([this]() {
         if (!protocol_ || audio_service_.IsMicrophoneMuted() ||
             GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy() ||
             pcm_tts_player_.IsBusy() || !audio_service_.IsPlaybackIdle()) {
@@ -1811,6 +1806,10 @@ void Application::StartProactiveGreeting() {
             return;
         }
         ESP_LOGI(TAG, "Starting proactive greeting");
+        // Use the phrase reported by the loaded WakeNet model, not the display-only
+        // CONFIG_CUSTOM_WAKE_WORD_DISPLAY string (which may be stale or customized).
+        const auto wake_words = audio_service_.GetWakeWords();
+        const std::string wake_word = wake_words.empty() ? "小智小智" : wake_words.front();
         BeginWakeWordInvoke(wake_word);
     });
 }
