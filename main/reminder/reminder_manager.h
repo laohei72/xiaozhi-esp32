@@ -116,7 +116,7 @@ public:
     // No response (or an interrupted response window): retry the reminder after delay_ms.
     bool RetryAwaitingResponse(uint32_t id, uint64_t delay_ms);
 
-    // "pending"/"due"/"playing"/"completed"/"cancelled".
+    // "pending"/"due"/"playing"/"awaiting_response"/"completed"/"cancelled".
     static const char* StateName(ReminderState state);
     // "relative"/"absolute"/"daily"/"weekly".
     static const char* TypeName(ReminderType type);
