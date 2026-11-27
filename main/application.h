@@ -170,7 +170,8 @@ private:
     // Monotonic deadline (ms) before which a reminder whose utterance failed or was interrupted is
     // not retried, so a barge-in does not replay the task on the very next tick.
     uint64_t reminder_retry_not_before_ms_ = 0;
-    // The local reminder has finished speaking; this window listens for an explicit response.
+    // The local reminder has finished speaking; listening remains open through unlimited
+    // assistant/user turns. This deadline is used only while waiting for server processing.
     uint64_t reminder_response_deadline_ms_ = 0;
     bool reminder_response_listening_ = false;
     bool reminder_response_resolution_pending_ = false;
