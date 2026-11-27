@@ -170,6 +170,11 @@ private:
     // Monotonic deadline (ms) before which a reminder whose utterance failed or was interrupted is
     // not retried, so a barge-in does not replay the task on the very next tick.
     uint64_t reminder_retry_not_before_ms_ = 0;
+    // Hold a due reminder while the local popup chime plays before its Baidu TTS.
+    bool reminder_chime_pending_ = false;
+    bool reminder_chime_start_pending_ = false;
+    bool reminder_chime_handoff_pending_ = false;
+    ReminderTask pending_reminder_task_;
     // Server Opus frames dropped while a PCM session owned the playback path (§9.5).
     std::atomic<uint32_t> pcm_tts_dropped_packets_{0};
     std::unique_ptr<Ota> ota_;
