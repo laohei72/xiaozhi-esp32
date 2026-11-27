@@ -445,7 +445,7 @@ namespace {
 // 5. Snooze and no-response retries delay only that task; other due reminders can proceed.
 void RunResponseLifecycle() {
     const int before = g_failures;
-    std::printf("SCENARIO response_lifecycle\\n");
+    std::printf("SCENARIO response_lifecycle\n");
     ResetState();
     ReminderManager manager;
     std::string error;
@@ -1038,7 +1038,7 @@ void RunInvalidInput() {
     Check(manager.ListReminders().size() == 1, "invalid/only_valid_task_stored",
           std::to_string(manager.ListReminders().size()));
 
-    // Full table: 16 tasks are kept, the 17th is rejected, and a finished task frees a slot.
+    // Full table: an awaiting-response task still occupies a slot; explicit completion frees it.
     g_fake_time_us = 0;
     ReminderManager full;
     int created = 0;
@@ -1061,6 +1061,9 @@ void RunInvalidInput() {
     Check(full.MarkDueTasks() == 16, "invalid/all_sixteen_due", "");
     full.MarkPlaying(1);
     full.OnPlaybackFinished(1, PcmTtsPlayer::Error::kSuccess);
+    Check(full.ListReminders()[0].state == ReminderState::kAwaitingResponse,
+          "invalid/awaiting_still_occupies_slot", "");
+    Check(full.ResolveAwaitingResponse(true, 0, error), "invalid/explicit_completion_frees_slot", error);
     error.clear();
     const uint32_t reused =
         full.CreateReminder("复用槽位", ReminderType::kRelative, 1000, 0, 0, 0, 0, 0, 0, error);
