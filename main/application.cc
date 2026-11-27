@@ -60,6 +60,10 @@ std::unique_ptr<Http> CreateBaiduTtsHttp() {
 // the next one: the usual cause is a barge-in, and replaying it immediately would talk over the
 // user.
 constexpr uint64_t kReminderRetryDelayMs = 30 * 1000;
+// After a reminder, wait 20 seconds for the first response. Once speech is detected, allow
+// the server up to 60 seconds to transcribe, reason and answer before reopening the window.
+constexpr uint64_t kReminderResponseTimeoutMs = 20 * 1000;
+constexpr uint64_t kReminderResponseProcessingTimeoutMs = 60 * 1000;
 
 // Reminder schedule fields are local time, while the firmware clock is UTC until a zone is set (the
 // time itself comes from the OTA server, there is no SNTP client). The zone therefore comes from
@@ -758,6 +762,7 @@ void Application::InitializeProtocol() {
                         ESP_LOGW(TAG, "Ignoring TTS start while a PCM TTS session is active");
                         return;
                     }
+                    if (reminder_response_listening_) reminder_response_deadline_ms_ = 0;
                     aborted_ = false;
                     SetDeviceState(kDeviceStateSpeaking);
                 });
@@ -768,7 +773,16 @@ void Application::InitializeProtocol() {
                         return;
                     }
                     if (GetDeviceState() == kDeviceStateSpeaking) {
-                        if (listening_mode_ == kListeningModeManualStop) {
+                        if (reminder_response_listening_) {
+                            ReminderTask waiting;
+                            if (reminder_manager_.GetAwaitingResponseTask(waiting)) {
+                                SetDeviceState(kDeviceStateListening);
+                            } else {
+                                reminder_response_listening_ = false;
+                                reminder_response_deadline_ms_ = 0;
+                                SetDeviceState(kDeviceStateIdle);
+                            }
+                        } else if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
                         } else {
                             SetDeviceState(kDeviceStateListening);
@@ -976,6 +990,14 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
         if (!protocol_->OpenAudioChannel()) {
             // Return to idle so the device is not stuck in the connecting
             // state (not every failure path reports a network error)
+            if (reminder_response_listening_) {
+                ReminderTask waiting;
+                if (reminder_manager_.GetAwaitingResponseTask(waiting)) {
+                    reminder_manager_.RetryAwaitingResponse(waiting.id, kReminderRetryDelayMs);
+                }
+                reminder_response_listening_ = false;
+                reminder_response_deadline_ms_ = 0;
+            }
             SetDeviceState(kDeviceStateIdle);
             return;
         }
@@ -1309,6 +1331,18 @@ void Application::StartListeningAudio() {
     protocol_->SendStartListening(listening_mode_);
     audio_service_.EnableVoiceProcessing(true);
 
+    if (reminder_response_listening_) {
+        ReminderTask waiting;
+        if (reminder_manager_.GetAwaitingResponseTask(waiting)) {
+            reminder_response_deadline_ms_ = NowMonotonicMs() + kReminderResponseTimeoutMs;
+            ESP_LOGI(TAG, "Listening for response to reminder %lu",
+                     static_cast<unsigned long>(waiting.id));
+        } else {
+            reminder_response_listening_ = false;
+            reminder_response_deadline_ms_ = 0;
+        }
+    }
+
     ConfigureWakeWordForListening();
 
     // Play popup sound after ResetDecoder (in EnableVoiceProcessing) has been called
@@ -1498,9 +1532,38 @@ bool Application::StopPcmTts(const char* reason) {
 }
 
 void Application::HandleReminderTick() {
-    // Settle first: a task whose trigger time passed while the device was busy becomes due here,
-    // and a recurring task is re-armed by OnPlaybackFinished() once it played.
+    // Settle first: a task whose trigger time passed while the device was busy becomes due here.
     reminder_manager_.MarkDueTasks();
+
+    // A successful reminder utterance remains active until the model explicitly resolves it.
+    // While the user is speaking or the server is answering, do not let the no-response timer fire.
+    ReminderTask awaiting_response;
+    if (reminder_manager_.GetAwaitingResponseTask(awaiting_response) &&
+        reminder_response_listening_) {
+        const auto state = GetDeviceState();
+        const uint64_t now = NowMonotonicMs();
+        if (state == kDeviceStateListening) {
+            if (audio_service_.IsVoiceDetected()) {
+                reminder_response_deadline_ms_ = now + kReminderResponseProcessingTimeoutMs;
+            } else if (reminder_response_deadline_ms_ != 0 &&
+                       now >= reminder_response_deadline_ms_) {
+                ESP_LOGI(TAG, "No response to reminder %lu; retrying later",
+                         static_cast<unsigned long>(awaiting_response.id));
+                reminder_manager_.RetryAwaitingResponse(awaiting_response.id,
+                                                        kReminderRetryDelayMs);
+                reminder_response_listening_ = false;
+                reminder_response_deadline_ms_ = 0;
+                SetDeviceState(kDeviceStateIdle);
+            }
+        } else if (state == kDeviceStateSpeaking || state == kDeviceStateConnecting) {
+            reminder_response_deadline_ms_ = 0;
+        } else if (state == kDeviceStateIdle) {
+            // Listening was closed unexpectedly (for example, a network interruption).
+            reminder_manager_.RetryAwaitingResponse(awaiting_response.id, kReminderRetryDelayMs);
+            reminder_response_listening_ = false;
+            reminder_response_deadline_ms_ = 0;
+        }
+    }
 
     // Never talk over a conversation, a notification or another utterance. The task stays due, so
     // nothing is lost by skipping it here.
@@ -1575,8 +1638,6 @@ void Application::HandlePcmTtsFinished(uint32_t session_id, PcmTtsPlayer::Error 
                      static_cast<unsigned long>(session_id), PcmTtsPlayer::GetErrorName(error));
         }
         if (reminder_id != 0) {
-            // Only kSuccess completes or reschedules the task; anything else keeps it retryable, and
-            // the gate below delays that retry so a barge-in does not replay the task immediately.
             reminder_manager_.OnPlaybackFinished(reminder_id, error);
             if (error != PcmTtsPlayer::Error::kSuccess) {
                 reminder_retry_not_before_ms_ = NowMonotonicMs() + kReminderRetryDelayMs;
@@ -1586,8 +1647,46 @@ void Application::HandlePcmTtsFinished(uint32_t session_id, PcmTtsPlayer::Error 
         if (GetDeviceState() == kDeviceStateSpeaking) {
             SetDeviceState(kDeviceStateIdle);
         }
+        if (reminder_id != 0 && error == PcmTtsPlayer::Error::kSuccess) {
+            // The reminder is now awaiting a semantic response, not completed. Open the existing
+            // audio channel and start one auto-stop utterance without sending a wake word.
+            StartReminderResponseListening();
+            return;
+        }
         Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
     });
+}
+
+void Application::StartReminderResponseListening() {
+    ReminderTask waiting;
+    if (!reminder_manager_.GetAwaitingResponseTask(waiting)) return;
+
+    reminder_response_deadline_ms_ = 0;
+    if (protocol_ == nullptr) {
+        ESP_LOGW(TAG, "Cannot listen for reminder %lu response: protocol unavailable",
+                 static_cast<unsigned long>(waiting.id));
+        reminder_manager_.RetryAwaitingResponse(waiting.id, kReminderRetryDelayMs);
+        reminder_response_listening_ = false;
+        Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        return;
+    }
+
+    reminder_response_listening_ = true;
+    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    if (!protocol_->IsAudioChannelOpened()) {
+        if (!SetDeviceState(kDeviceStateConnecting)) {
+            reminder_manager_.RetryAwaitingResponse(waiting.id, kReminderRetryDelayMs);
+            reminder_response_listening_ = false;
+            Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+            return;
+        }
+        Schedule([this]() { ContinueOpenAudioChannel(kListeningModeAutoStop); });
+        return;
+    }
+
+    ESP_LOGI(TAG, "Starting response listening for reminder %lu",
+             static_cast<unsigned long>(waiting.id));
+    SetListeningMode(kListeningModeAutoStop);
 }
 
 void Application::Schedule(std::function<void()>&& callback) {
