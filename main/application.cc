@@ -1602,7 +1602,12 @@ bool Application::StartReminderPlayback(const ReminderTask& task) {
 
     // Claim the task before any I/O: TakeNextDueTask() is read-only, so this is what keeps the next
     // tick from starting the same task again while the worker is still fetching the credentials.
-    reminder_manager_.MarkPlaying(id);
+    if (!reminder_manager_.MarkPlaying(id)) {
+        // Cancellation or rescheduling may race with the chime handoff. Do not start stale audio.
+        ESP_LOGI(TAG, "Reminder %lu is no longer due; skipping playback",
+                 static_cast<unsigned long>(id));
+        return false;
+    }
 
     // The source opens itself on the player's worker task (§9.1), so the token request and the HTTP
     // round trip never block the main event loop.
