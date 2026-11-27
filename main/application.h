@@ -173,6 +173,7 @@ private:
     // The local reminder has finished speaking; this window listens for an explicit response.
     uint64_t reminder_response_deadline_ms_ = 0;
     bool reminder_response_listening_ = false;
+    bool reminder_response_resolution_pending_ = false;
     // Server Opus frames dropped while a PCM session owned the playback path (§9.5).
     std::atomic<uint32_t> pcm_tts_dropped_packets_{0};
     std::unique_ptr<Ota> ota_;
