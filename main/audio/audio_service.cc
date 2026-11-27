@@ -836,9 +836,14 @@ void AudioService::EnableDeviceAec(bool enable) {
 }
 
 void AudioService::SetMicrophoneMuted(bool muted) {
-    const bool previous = microphone_muted_.exchange(muted);
+    const bool previous = microphone_muted_.load();
     if (previous == muted) {
         return;
+    }
+    // Mute takes effect immediately. Unmute is published only after all stale buffers and
+    // resampler history have been cleared, so the input task cannot race ahead of preparation.
+    if (muted) {
+        microphone_muted_.store(true);
     }
     microphone_mute_generation_.fetch_add(1);
     ESP_LOGI(TAG, "Microphone %s", muted ? "muted" : "unmuted");
@@ -865,6 +870,7 @@ void AudioService::SetMicrophoneMuted(bool muted) {
             }
         }
         audio_input_need_warmup_.store(true);
+        microphone_muted_.store(false);
     }
 }
 
