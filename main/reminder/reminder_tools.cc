@@ -367,6 +367,26 @@ void RegisterReminderTools(ReminderManager& manager) {
                            return true;
                        });
 
+    mcp_server.AddTool(
+        "self.reminders.resolve",
+        "TEST ONLY: when the user confirms a reminder is completed, wants to snooze it, or no "
+        "longer needs it, call this tool. Always pass the reminder id shown in the reminder "
+        "context. Use action completed, snooze, or cancel; delay_seconds is the requested delay "
+        "for snooze. This test tool only logs the arguments and does not change any reminder.",
+        PropertyList({
+            Property("id", kPropertyTypeInteger, 0, 65535),
+            Property("action", kPropertyTypeString).SetMaxLength(32),
+            Property("delay_seconds", kPropertyTypeInteger, 0, 0, 86400),
+        }),
+        [](const PropertyList& properties) -> ToolResult {
+            const int id = properties["id"].value<int>();
+            const std::string action = properties["action"].value<std::string>();
+            const int delay_seconds = properties["delay_seconds"].value<int>();
+            ESP_LOGI("ReminderTest", "resolve called: id=%d action=%s delay=%d",
+                     id, action.c_str(), delay_seconds);
+            return std::string("received");
+        });
+
     ESP_LOGI(TAG, "Reminder tools registered");
 }
 
