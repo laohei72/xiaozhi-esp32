@@ -181,6 +181,7 @@ private:
     uint32_t reminder_audio_sent_ = 0;
     uint32_t reminder_audio_failed_ = 0;
     uint32_t reminder_audio_discarded_ = 0;
+    std::atomic<bool> reminder_response_vad_speaking_{false};
     // Server Opus frames dropped while a PCM session owned the playback path (§9.5).
     std::atomic<uint32_t> pcm_tts_dropped_packets_{0};
     std::unique_ptr<Ota> ota_;
