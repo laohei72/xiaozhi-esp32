@@ -776,9 +776,11 @@ void Application::InitializeProtocol() {
                         if (reminder_response_listening_) {
                             ReminderTask waiting;
                             if (reminder_manager_.GetAwaitingResponseTask(waiting)) {
+                                reminder_response_resolution_pending_ = false;
                                 SetDeviceState(kDeviceStateListening);
                             } else {
                                 reminder_response_listening_ = false;
+                                reminder_response_resolution_pending_ = false;
                                 reminder_response_deadline_ms_ = 0;
                                 SetDeviceState(kDeviceStateIdle);
                                 Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
@@ -997,6 +999,7 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
                     reminder_manager_.RetryAwaitingResponse(waiting.id, kReminderRetryDelayMs);
                 }
                 reminder_response_listening_ = false;
+                reminder_response_resolution_pending_ = false;
                 reminder_response_deadline_ms_ = 0;
                 board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
             }
@@ -1556,17 +1559,20 @@ void Application::HandleReminderTick() {
                 reminder_manager_.RetryAwaitingResponse(awaiting_response.id,
                                                         kReminderRetryDelayMs);
                 reminder_response_listening_ = false;
+                reminder_response_resolution_pending_ = false;
                 reminder_response_deadline_ms_ = 0;
                 SetDeviceState(kDeviceStateIdle);
                 Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
             }
         } else if (state == kDeviceStateListening && !has_awaiting_response) {
             // The model has resolved the task but has not started its spoken acknowledgement yet.
-            // Keep the channel open briefly for that answer; tts/start cancels this guard.
-            if (reminder_response_deadline_ms_ == 0) {
+            // Start a separate grace period; tts/start cancels this guard.
+            if (!reminder_response_resolution_pending_) {
+                reminder_response_resolution_pending_ = true;
                 reminder_response_deadline_ms_ = now + kReminderResponseProcessingTimeoutMs;
-            } else if (now >= reminder_response_deadline_ms_) {
+            } else if (reminder_response_deadline_ms_ != 0 && now >= reminder_response_deadline_ms_) {
                 reminder_response_listening_ = false;
+                reminder_response_resolution_pending_ = false;
                 reminder_response_deadline_ms_ = 0;
                 if (protocol_) protocol_->SendStopListening();
                 SetDeviceState(kDeviceStateIdle);
@@ -1580,6 +1586,7 @@ void Application::HandleReminderTick() {
                 reminder_manager_.RetryAwaitingResponse(awaiting_response.id, kReminderRetryDelayMs);
             }
             reminder_response_listening_ = false;
+            reminder_response_resolution_pending_ = false;
             reminder_response_deadline_ms_ = 0;
             Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
         }
@@ -1682,11 +1689,13 @@ void Application::StartReminderResponseListening() {
     if (!reminder_manager_.GetAwaitingResponseTask(waiting)) return;
 
     reminder_response_deadline_ms_ = 0;
+    reminder_response_resolution_pending_ = false;
     if (protocol_ == nullptr) {
         ESP_LOGW(TAG, "Cannot listen for reminder %lu response: protocol unavailable",
                  static_cast<unsigned long>(waiting.id));
         reminder_manager_.RetryAwaitingResponse(waiting.id, kReminderRetryDelayMs);
         reminder_response_listening_ = false;
+        reminder_response_resolution_pending_ = false;
         Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
         return;
     }
@@ -1697,6 +1706,7 @@ void Application::StartReminderResponseListening() {
         if (!SetDeviceState(kDeviceStateConnecting)) {
             reminder_manager_.RetryAwaitingResponse(waiting.id, kReminderRetryDelayMs);
             reminder_response_listening_ = false;
+            reminder_response_resolution_pending_ = false;
             Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
             return;
         }
