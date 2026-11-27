@@ -62,7 +62,7 @@ std::unique_ptr<Http> CreateBaiduTtsHttp() {
 constexpr uint64_t kReminderRetryDelayMs = 30 * 1000;
 // After a reminder, wait 20 seconds for the first response. Once speech is detected, allow
 // the server up to 60 seconds to transcribe, reason and answer before reopening the window.
-constexpr uint64_t kReminderResponseTimeoutMs = 20 * 1000;
+constexpr uint64_t kReminderResponseTimeoutMs = 30 * 1000;
 constexpr uint64_t kReminderResponseProcessingTimeoutMs = 60 * 1000;
 
 // Reminder schedule fields are local time, while the firmware clock is UTC until a zone is set (the
