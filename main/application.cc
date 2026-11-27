@@ -997,6 +997,7 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
                 }
                 reminder_response_listening_ = false;
                 reminder_response_deadline_ms_ = 0;
+                board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
             }
             SetDeviceState(kDeviceStateIdle);
             return;
@@ -1539,11 +1540,12 @@ void Application::HandleReminderTick() {
     // A successful reminder utterance remains active until the model explicitly resolves it.
     // While the user is speaking or the server is answering, do not let the no-response timer fire.
     ReminderTask awaiting_response;
-    if (reminder_manager_.GetAwaitingResponseTask(awaiting_response) &&
-        reminder_response_listening_) {
+    const bool has_awaiting_response =
+        reminder_manager_.GetAwaitingResponseTask(awaiting_response);
+    if (reminder_response_listening_) {
         const auto state = GetDeviceState();
         const uint64_t now = NowMonotonicMs();
-        if (state == kDeviceStateListening) {
+        if (state == kDeviceStateListening && has_awaiting_response) {
             if (audio_service_.IsVoiceDetected()) {
                 reminder_response_deadline_ms_ = now + kReminderResponseProcessingTimeoutMs;
             } else if (reminder_response_deadline_ms_ != 0 &&
@@ -1555,14 +1557,30 @@ void Application::HandleReminderTick() {
                 reminder_response_listening_ = false;
                 reminder_response_deadline_ms_ = 0;
                 SetDeviceState(kDeviceStateIdle);
+                Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+            }
+        } else if (state == kDeviceStateListening && !has_awaiting_response) {
+            // The model has resolved the task but has not started its spoken acknowledgement yet.
+            // Keep the channel open briefly for that answer; tts/start cancels this guard.
+            if (reminder_response_deadline_ms_ == 0) {
+                reminder_response_deadline_ms_ = now + kReminderResponseProcessingTimeoutMs;
+            } else if (now >= reminder_response_deadline_ms_) {
+                reminder_response_listening_ = false;
+                reminder_response_deadline_ms_ = 0;
+                if (protocol_) protocol_->SendStopListening();
+                SetDeviceState(kDeviceStateIdle);
+                Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
             }
         } else if (state == kDeviceStateSpeaking || state == kDeviceStateConnecting) {
             reminder_response_deadline_ms_ = 0;
         } else if (state == kDeviceStateIdle) {
             // Listening was closed unexpectedly (for example, a network interruption).
-            reminder_manager_.RetryAwaitingResponse(awaiting_response.id, kReminderRetryDelayMs);
+            if (has_awaiting_response) {
+                reminder_manager_.RetryAwaitingResponse(awaiting_response.id, kReminderRetryDelayMs);
+            }
             reminder_response_listening_ = false;
             reminder_response_deadline_ms_ = 0;
+            Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
         }
     }
 
