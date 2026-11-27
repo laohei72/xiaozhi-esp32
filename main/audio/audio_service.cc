@@ -507,7 +507,7 @@ void AudioService::OpusCodecTask() {
         if (!audio_encode_queue_.empty()) {
             auto task = std::move(audio_encode_queue_.front());
             audio_encode_queue_.pop_front();
-            const uint32_t mute_generation = microphone_mute_generation_.load();
+            const uint32_t mute_generation = task.microphone_generation;
             audio_queue_cv_.notify_all();
             lock.unlock();
             if (microphone_muted_.load()) {
@@ -633,12 +633,14 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
     AudioTask task;
     task.type = type;
     task.pcm = std::move(pcm);
+    task.microphone_generation = microphone_mute_generation_.load();
 
     uint32_t dropped_total = 0;
     {
         /* Push the task to the encode queue */
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
-        if (microphone_muted_.load()) {
+        if (microphone_muted_.load() ||
+            task.microphone_generation != microphone_mute_generation_.load()) {
             return;
         }
 
