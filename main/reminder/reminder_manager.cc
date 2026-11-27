@@ -759,7 +759,7 @@ bool ReminderManager::ResolveAwaitingResponse(bool completed, uint64_t delay_ms,
         task->retry_not_before_ms = NowMonotonicMs() + delay_ms;
         ESP_LOGI(TAG, "Reminder %u snoozed", task->id);
     } else if (IsRecurring(task->type)) {
-        const int64_t after = task->last_fired_unix > 0 ? task->last_fired_unix : NowUnixSeconds();
+        const int64_t after = std::max(task->last_fired_unix, NowUnixSeconds());
         const int64_t next = ComputeNextTrigger(*task, after);
         if (next <= 0) {
             out_error = "failed to calculate the next recurring reminder";
