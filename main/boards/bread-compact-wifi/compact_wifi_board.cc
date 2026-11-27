@@ -170,7 +170,8 @@ Application::GetInstance().StartProactiveGreeting();
                 GetDisplay()->ShowNotification("请先解除麦克风静音");
                 return;
             }
-            app.WakeWordInvoke("小智小智");
+            const auto wake_words = app.GetAudioService().GetWakeWords();
+            app.WakeWordInvoke(wake_words.empty() ? "小智小智" : wake_words.front());
         });
         function_button_.OnDoubleClick([this]() {
             ReconnectWifi();
