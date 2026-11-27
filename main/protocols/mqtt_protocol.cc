@@ -15,6 +15,9 @@
 
 #define TAG "MQTT"
 
+// Temporary diagnostics for the raw UDP result of audio uplink sends.
+#define REMINDER_RESPONSE_DIAG 1
+
 MqttProtocol::MqttProtocol() {
     event_group_handle_ = xEventGroupCreate();
 
@@ -139,8 +142,10 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
             ParseServerHello(root);
         } else if (strcmp(type->valuestring, "goodbye") == 0) {
             auto session_id = cJSON_GetObjectItem(root, "session_id");
-            ESP_LOGI(TAG, "Received goodbye message, session_id: %s",
-                     cJSON_IsString(session_id) ? session_id->valuestring : "null");
+            auto reason = cJSON_GetObjectItem(root, "reason");
+            ESP_LOGI(TAG, "Received goodbye message, session_id: %s, reason: %s",
+                     cJSON_IsString(session_id) ? session_id->valuestring : "null",
+                     cJSON_IsString(reason) ? reason->valuestring : "<none>");
             if (cJSON_IsString(session_id) && session_id_ == session_id->valuestring) {
                 auto alive = alive_;  // Capture alive flag
                 Application::GetInstance().Schedule([this, alive]() {
@@ -250,8 +255,29 @@ bool MqttProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
         return false;
     }
 
-    // Send without holding channel_mutex_ (see above).
-    return udp->Send(encrypted) > 0;
+    // Send without holding channel_mutex_ (see above). Keep the raw transport result so
+    // diagnostics can distinguish UDP send failures from earlier crypto/channel failures.
+    const auto send_result = udp->Send(encrypted);
+#ifdef REMINDER_RESPONSE_DIAG
+    ++audio_udp_send_calls_;
+    if (send_result > 0) ++audio_udp_send_positive_;
+    else ++audio_udp_send_nonpositive_;
+    audio_udp_last_send_result_ = static_cast<long>(send_result);
+    const int64_t now_us = esp_timer_get_time();
+    if (audio_udp_stats_window_start_us_ == 0) {
+        audio_udp_stats_window_start_us_ = now_us;
+    } else if (now_us - audio_udp_stats_window_start_us_ >= 10LL * 1000 * 1000) {
+        ESP_LOGI(TAG,
+                 "Audio UDP send 10s: calls=%lu positive=%lu nonpositive=%lu last_raw_result=%ld",
+                 static_cast<unsigned long>(audio_udp_send_calls_),
+                 static_cast<unsigned long>(audio_udp_send_positive_),
+                 static_cast<unsigned long>(audio_udp_send_nonpositive_),
+                 audio_udp_last_send_result_);
+        audio_udp_send_calls_ = audio_udp_send_positive_ = audio_udp_send_nonpositive_ = 0;
+        audio_udp_stats_window_start_us_ = now_us;
+    }
+#endif
+    return send_result > 0;
 }
 
 void MqttProtocol::CloseAudioChannel(bool send_goodbye) {
@@ -295,6 +321,11 @@ bool MqttProtocol::OpenAudioChannel() {
 
     error_occurred_ = false;
     session_id_ = "";
+#ifdef REMINDER_RESPONSE_DIAG
+    audio_udp_send_calls_ = audio_udp_send_positive_ = audio_udp_send_nonpositive_ = 0;
+    audio_udp_last_send_result_ = 0;
+    audio_udp_stats_window_start_us_ = esp_timer_get_time();
+#endif
     uint64_t generation;
     std::shared_ptr<Udp> previous_udp;
     {
