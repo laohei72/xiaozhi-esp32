@@ -1545,7 +1545,7 @@ void Application::HandleReminderTick() {
     reminder_manager_.MarkDueTasks();
 
     // A successful reminder utterance remains active until the model explicitly resolves it.
-    // While the user is speaking or the server is answering, do not let the no-response timer fire.
+    // Silence never expires the listening session; only a detected utterance gets a processing deadline.
     ReminderTask awaiting_response;
     const bool has_awaiting_response =
         reminder_manager_.GetAwaitingResponseTask(awaiting_response);
