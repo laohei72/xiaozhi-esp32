@@ -49,6 +49,7 @@ bool ParseStateName(const char* name, ReminderState& state) {
     if (std::strcmp(name, "pending") == 0) state = ReminderState::kPending;
     else if (std::strcmp(name, "due") == 0) state = ReminderState::kDue;
     else if (std::strcmp(name, "playing") == 0) state = ReminderState::kPlaying;
+    else if (std::strcmp(name, "awaiting_response") == 0) state = ReminderState::kAwaitingResponse;
     else if (std::strcmp(name, "completed") == 0) state = ReminderState::kCompleted;
     else if (std::strcmp(name, "cancelled") == 0) state = ReminderState::kCancelled;
     else return false;
@@ -80,6 +81,7 @@ const char* ReminderManager::StateName(ReminderState state) {
         case ReminderState::kPending: return "pending";
         case ReminderState::kDue: return "due";
         case ReminderState::kPlaying: return "playing";
+        case ReminderState::kAwaitingResponse: return "awaiting_response";
         case ReminderState::kCompleted: return "completed";
         case ReminderState::kCancelled: return "cancelled";
     }
@@ -396,10 +398,11 @@ void ReminderManager::Init() {
     const int64_t now_unix = time_synced ? NowUnixSeconds() : 0;
     bool changed = false;
     for (auto& task : tasks_) {
-        if (task.state == ReminderState::kPlaying) {
+        if (task.state == ReminderState::kPlaying ||
+            task.state == ReminderState::kAwaitingResponse) {
             task.state = ReminderState::kDue;
             changed = true;
-            ESP_LOGW(TAG, "Reminder %u was playing at restart, marking it due", task.id);
+            ESP_LOGW(TAG, "Reminder %u was active at restart, marking it due", task.id);
             continue;
         }
         if (task.state != ReminderState::kPending) continue;
@@ -632,6 +635,8 @@ size_t ReminderManager::MarkDueTasks() {
 
 bool ReminderManager::TakeNextDueTask(ReminderTask& out) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (NowMonotonicMs() < retry_not_before_ms_) return false;
+    retry_not_before_ms_ = 0;
     const ReminderTask* next = nullptr;
     for (const auto& task : tasks_) {
         if (task.state != ReminderState::kDue) continue;
@@ -689,7 +694,95 @@ void ReminderManager::OnPlaybackFinished(uint32_t id, PcmTtsPlayer::Error error)
         return;
     }
     if (error == PcmTtsPlayer::Error::kSuccess) {
+        task->state = ReminderState::kAwaitingResponse;
+        ESP_LOGI(TAG, "Reminder %u playback finished; awaiting user response", id);
+    } else if (error == PcmTtsPlayer::Error::kCancelled) {
         if (IsRecurring(task->type)) {
+            task->state = ReminderState::kPending;
+            task->recurring_active = true;
+        } else {
+            task->state = ReminderState::kDue;
+        }
+        ESP_LOGW(TAG, "Reminder %u was interrupted before it finished, it stays active", id);
+    } else {
+        task->state = ReminderState::kDue;
+        ESP_LOGW(TAG, "Reminder %u playback failed (%s), it stays due", id,
+                 PcmTtsPlayer::GetErrorName(error));
+    }
+    SaveLocked();
+}
+
+bool ReminderManager::GetAwaitingResponseTask(ReminderTask& out) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& task : tasks_) {
+        if (task.state == ReminderState::kAwaitingResponse) {
+            out = task;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ReminderManager::ResolveAwaitingResponse(bool completed, uint64_t delay_ms,
+                                              std::string& out_error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ReminderTask* task = nullptr;
+    for (auto& candidate : tasks_) {
+        if (candidate.state == ReminderState::kAwaitingResponse) {
+            if (task != nullptr) {
+                out_error = "multiple reminders are awaiting a response";
+                return false;
+            }
+            task = &candidate;
+        }
+    }
+    if (task == nullptr) {
+        out_error = "there is no reminder awaiting a response";
+        return false;
+    }
+
+    if (!completed) {
+        if (delay_ms == 0 || delay_ms > UINT64_MAX - NowMonotonicMs()) {
+            out_error = "invalid snooze delay";
+            return false;
+        }
+        task->state = ReminderState::kDue;
+        retry_not_before_ms_ = NowMonotonicMs() + delay_ms;
+        ESP_LOGI(TAG, "Reminder %u snoozed", task->id);
+    } else if (IsRecurring(task->type)) {
+        const int64_t after = task->last_fired_unix > 0 ? task->last_fired_unix : NowUnixSeconds();
+        const int64_t next = ComputeNextTrigger(*task, after);
+        if (next <= 0) {
+            out_error = "failed to calculate the next recurring reminder";
+            return false;
+        }
+        task->trigger_unix = next;
+        task->state = ReminderState::kPending;
+        task->recurring_active = true;
+        ESP_LOGI(TAG, "Reminder %u confirmed; next recurring run scheduled", task->id);
+    } else {
+        task->state = ReminderState::kCompleted;
+        task->recurring_active = false;
+        ESP_LOGI(TAG, "Reminder %u explicitly completed", task->id);
+    }
+    SaveLocked();
+    out_error.clear();
+    return true;
+}
+
+bool ReminderManager::RetryAwaitingResponse(uint32_t id, uint64_t delay_ms) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ReminderTask* task = FindLocked(id);
+    if (task == nullptr || task->state != ReminderState::kAwaitingResponse) return false;
+    const uint64_t now = NowMonotonicMs();
+    if (delay_ms > UINT64_MAX - now) return false;
+    task->state = ReminderState::kDue;
+    retry_not_before_ms_ = now + delay_ms;
+    SaveLocked();
+    ESP_LOGI(TAG, "Reminder %u response timed out; retry scheduled", id);
+    return true;
+}
+
             const int64_t after =
                 task->last_fired_unix > 0 ? task->last_fired_unix : NowUnixSeconds();
             const int64_t next = ComputeNextTrigger(*task, after);
