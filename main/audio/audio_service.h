@@ -247,6 +247,7 @@ private:
     std::atomic<bool> service_stopped_{true};
     std::atomic<bool> audio_input_need_warmup_{false};
     std::atomic<bool> microphone_muted_{false};
+    std::atomic<uint32_t> microphone_mute_generation_{0};
 
     esp_timer_handle_t audio_power_timer_ = nullptr;
     std::chrono::steady_clock::time_point last_input_time_;
