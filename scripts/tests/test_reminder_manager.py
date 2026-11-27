@@ -56,6 +56,7 @@ STUBS = {
         class Settings {
         public:
             inline static std::map<std::string, std::string> store;
+            inline static bool fail_writes = false;
 
             Settings(const std::string& ns, bool read_write = false)
                 : ns_(ns), read_write_(read_write) {}
@@ -66,6 +67,7 @@ STUBS = {
                 return it == store.end() ? default_value : it->second;
             }
             bool SetString(const std::string& key, const std::string& value) {
+                if (fail_writes) return false;
                 store[ns_ + "/" + key] = value;
                 return true;
             }
@@ -219,6 +221,7 @@ void Finish(const char* scenario, int failures_before) {
 
 void ResetState() {
     Settings::store.clear();
+    Settings::fail_writes = false;
     g_fake_time_us = 0;
     g_fake_unix = 0;
 }
@@ -239,6 +242,7 @@ void RunDailyRecurring();
 void RunWeeklyRecurring();
 void RunPersistAndRestore();
 void RunInvalidInput();
+void RunPersistenceFailure();
 
 }  // namespace
 '''
@@ -1027,12 +1031,62 @@ int main(int argc, char** argv) {
         RunPersistAndRestore();
     } else if (scenario == "invalid_input") {
         RunInvalidInput();
+    } else if (scenario == "persistence_failure") {
+        RunPersistenceFailure();
     } else {
         std::printf("unknown scenario: %s\n", scenario.c_str());
         return 2;
     }
     return g_failures == 0 ? 0 : 1;
 }
+'''
+
+DRIVER_SCENARIOS_J = r'''
+
+// 13. A failed NVS write must not be reported as a successful create/update/cancel.
+void RunPersistenceFailure() {
+    const int before = g_failures;
+    std::printf("SCENARIO persistence_failure\n");
+    ResetState();
+    ReminderManager manager;
+    std::string error;
+
+    Settings::fail_writes = true;
+    const uint32_t failed_create =
+        manager.CreateReminder("不应丢失", ReminderType::kRelative, 60000, 0, 0, 0, 0, 0, 0, error);
+    Check(failed_create == 0 && error == "storage-error", "storage/create_reports_failure", error);
+    Check(manager.ListReminders().empty(), "storage/failed_create_rolled_back",
+          std::to_string(manager.ListReminders().size()));
+
+    Settings::fail_writes = false;
+    const uint32_t id =
+        manager.CreateReminder("原始提醒", ReminderType::kRelative, 60000, 0, 0, 0, 0, 0, 0, error);
+    Check(id == 1, "storage/id_not_consumed_after_failed_create", std::to_string(id));
+
+    Settings::fail_writes = true;
+    Check(!manager.UpdateReminder(id, "修改失败", ReminderType::kRelative, 120000, 0, 0, 0, 0, 0,
+                                  0, error) && error == "storage-error",
+          "storage/update_reports_failure", error);
+    auto tasks = manager.ListReminders();
+    Check(tasks.size() == 1 && tasks[0].text == "原始提醒",
+          "storage/failed_update_rolled_back", tasks.empty() ? "missing" : tasks[0].text);
+
+    error.clear();
+    Check(!manager.CancelReminder(id, error) && error == "storage-error",
+          "storage/cancel_reports_failure", error);
+    tasks = manager.ListReminders();
+    Check(tasks.size() == 1 && tasks[0].state == ReminderState::kPending,
+          "storage/failed_cancel_rolled_back", tasks.empty() ? "missing" : StateOf(tasks[0]));
+
+    error.clear();
+    Check(!manager.CancelAll(error) && error == "storage-error",
+          "storage/cancel_all_reports_failure", error);
+    tasks = manager.ListReminders();
+    Check(tasks.size() == 1 && tasks[0].state == ReminderState::kPending,
+          "storage/failed_cancel_all_rolled_back", tasks.empty() ? "missing" : StateOf(tasks[0]));
+    Finish("persistence_failure", before);
+}
+
 '''
 
 DRIVER = (
@@ -1046,6 +1100,7 @@ DRIVER = (
     + DRIVER_SCENARIOS_G
     + DRIVER_SCENARIOS_H
     + DRIVER_SCENARIOS_I
+    + DRIVER_SCENARIOS_J
 )
 
 
@@ -1163,6 +1218,9 @@ class ReminderManagerTest(unittest.TestCase):
 
     def test_invalid_input_and_the_task_limit_are_rejected(self):
         self._run("invalid_input")
+
+    def test_persistence_failures_are_reported_and_rolled_back(self):
+        self._run("persistence_failure")
 
 
 class ReminderToolsCompileTest(unittest.TestCase):

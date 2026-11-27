@@ -137,7 +137,7 @@ private:
     // monotonic anchor so restored ids never collide.
     void PruneFinishedLocked();
     bool LoadLocked();
-    void SaveLocked();
+    bool SaveLocked();
 
     mutable std::mutex mutex_;
     std::vector<ReminderTask> tasks_;

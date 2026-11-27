@@ -67,6 +67,9 @@ std::string ErrorText(const std::string& code) {
     if (code == "not-found") {
         return "no reminder with that id";
     }
+    if (code == "storage-error") {
+        return "the device could not save the reminder; the requested change was not applied";
+    }
     return code.empty() ? std::string("the reminder could not be saved") : code;
 }
 

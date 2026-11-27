@@ -356,8 +356,8 @@ static bool PruneAndSave(std::vector<ReminderTask>& tasks) {
         if (settings.SetString(kNvsKey, json) && settings.Commit()) {
             return true;
         }
-        // The write failed, most likely because the NVS partition is full: drop the oldest
-        // finished task and retry. If nothing can be dropped, give up instead of aborting.
+        // The write or commit failed. Drop only the oldest finished task and retry; never
+        // discard an active reminder. The caller restores its pre-change snapshot on final failure.
         uint32_t newest_id = 0;
         for (const auto& task : tasks) {
             newest_id = std::max(newest_id, task.id);
@@ -372,7 +372,7 @@ static bool PruneAndSave(std::vector<ReminderTask>& tasks) {
             }
         }
         if (victim == tasks.end()) {
-            ESP_LOGE(TAG, "Failed to persist reminders: NVS full and nothing left to drop");
+            ESP_LOGE(TAG, "Failed to persist reminders: storage error and no finished task can be pruned");
             return false;
         }
         ESP_LOGW(TAG, "NVS full, dropping finished reminder %u to free space",
@@ -381,10 +381,16 @@ static bool PruneAndSave(std::vector<ReminderTask>& tasks) {
     }
 }
 
-void ReminderManager::SaveLocked() {
+bool ReminderManager::SaveLocked() {
+    // PruneAndSave() may remove completed tasks while retrying. Keep that pruning transactional:
+    // if persistence still fails, restore the exact list that existed when this save began.
+    const std::vector<ReminderTask> before_save = tasks_;
     if (!PruneAndSave(tasks_)) {
+        tasks_ = before_save;
         ESP_LOGE(TAG, "Reminder changes could not be persisted");
+        return false;
     }
+    return true;
 }
 
 void ReminderManager::Init() {
@@ -394,6 +400,7 @@ void ReminderManager::Init() {
     const uint64_t now_ms = NowMonotonicMs();
     const bool time_synced = IsSystemTimeSynced();
     const int64_t now_unix = time_synced ? NowUnixSeconds() : 0;
+    const std::vector<ReminderTask> before_cancel_all = tasks_;
     bool changed = false;
     for (auto& task : tasks_) {
         if (task.state == ReminderState::kPlaying) {
@@ -522,12 +529,19 @@ uint32_t ReminderManager::CreateReminder(const std::string& text, ReminderType t
                               weekly_hour, weekly_minute, task.created_ms, task);
     if (!out_error.empty()) return 0;
 
+    const std::vector<ReminderTask> before_create = tasks_;
+    const uint32_t previous_next_id = next_id_;
     PruneFinishedLocked();
     task.id = next_id_++;
     if (next_id_ == 0) next_id_ = 1;
     const uint32_t id = task.id;
     tasks_.push_back(task);
-    SaveLocked();
+    if (!SaveLocked()) {
+        tasks_ = before_create;
+        next_id_ = previous_next_id;
+        out_error = "storage-error";
+        return 0;
+    }
     ESP_LOGI(TAG, "Created reminder %u (%s): %s", id, TypeName(type), text.c_str());
     return id;
 }
@@ -551,6 +565,7 @@ bool ReminderManager::UpdateReminder(uint32_t id, const std::string& text, Remin
         out_error = "not-found";
         return false;
     }
+    const std::vector<ReminderTask> before_update = tasks_;
     ReminderTask updated = *task;
     out_error = BuildSchedule(type, delay_ms, trigger_unix, daily_hour, daily_minute, weekly_weekday,
                               weekly_hour, weekly_minute, updated.created_ms, updated);
@@ -558,7 +573,11 @@ bool ReminderManager::UpdateReminder(uint32_t id, const std::string& text, Remin
     if (!text.empty()) updated.text = text;
     updated.state = ReminderState::kPending;
     *task = updated;
-    SaveLocked();
+    if (!SaveLocked()) {
+        tasks_ = before_update;
+        out_error = "storage-error";
+        return false;
+    }
     ESP_LOGI(TAG, "Updated reminder %u (%s): %s", id, TypeName(type), updated.text.c_str());
     return true;
 }
@@ -571,9 +590,14 @@ bool ReminderManager::CancelReminder(uint32_t id, std::string& out_error) {
         out_error = "not-found";
         return false;
     }
+    const std::vector<ReminderTask> before_cancel = tasks_;
     task->state = ReminderState::kCancelled;
     task->recurring_active = false;
-    SaveLocked();
+    if (!SaveLocked()) {
+        tasks_ = before_cancel;
+        out_error = "storage-error";
+        return false;
+    }
     ESP_LOGI(TAG, "Cancelled reminder %u", id);
     return true;
 }
@@ -588,7 +612,11 @@ bool ReminderManager::CancelAll(std::string& out_error) {
         task.recurring_active = false;
         changed = true;
     }
-    if (changed) SaveLocked();
+    if (changed && !SaveLocked()) {
+        tasks_ = before_cancel_all;
+        out_error = "storage-error";
+        return false;
+    }
     ESP_LOGI(TAG, "Cancelled all reminders (%u task(s))", static_cast<unsigned>(tasks_.size()));
     return true;
 }
