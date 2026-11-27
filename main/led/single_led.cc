@@ -53,6 +53,7 @@ SingleLed::~SingleLed() {
 
 
 void SingleLed::SetColor(uint8_t r, uint8_t g, uint8_t b) {
+    std::lock_guard<std::mutex> lock(mutex_);
     r_ = r;
     g_ = g;
     b_ = b;
@@ -126,6 +127,7 @@ void SingleLed::SetMicrophoneMuted(bool muted) {
 }
 
 void SingleLed::OnStateChanged() {
+    std::lock_guard<std::mutex> state_lock(state_mutex_);
     if (microphone_muted_.load()) {
         SetColor(HIGH_BRIGHTNESS, 0, 0);
         TurnOn();
