@@ -44,6 +44,7 @@ public:
     void OnVadStateChange(std::function<void(bool speaking)> callback) override;
 
     void EncodeWakeWordData() override;
+    void ClearWakeWordData() override;
     bool GetWakeWordOpus(std::vector<uint8_t>& opus) override;
     const std::string& GetLastDetectedWakeWord() const override { return last_detected_wake_word_; }
 
@@ -97,6 +98,7 @@ private:
     StaticTask_t* wake_word_encode_task_buffer_ = nullptr;
     StackType_t* wake_word_encode_task_stack_ = nullptr;
     WakeWordAudioCache wake_word_audio_cache_;
+    std::atomic<uint32_t> wake_word_cache_generation_{0};
     std::deque<std::vector<uint8_t>> wake_word_opus_;
     std::mutex wake_word_mutex_;
     std::condition_variable wake_word_cv_;
