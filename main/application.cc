@@ -68,8 +68,6 @@ constexpr uint64_t kReminderRetryDelayMs = 30 * 1000;
 // detected, allow the server up to 60 seconds after the last voice activity to process and answer.
 // The listening window is reopened after every assistant response, with no turn-count limit.
 constexpr uint64_t kReminderResponseProcessingTimeoutMs = 60 * 1000;
-// Temporary experiment: only reminder-response listening uses manual-stop mode.
-constexpr bool kUseManualStopForReminderResponse = false;
 
 // Reminder schedule fields are local time, while the firmware clock is UTC until a zone is set (the
 // time itself comes from the OTA server, there is no SNTP client). The zone therefore comes from
@@ -1738,7 +1736,7 @@ void Application::HandlePcmTtsFinished(uint32_t session_id, PcmTtsPlayer::Error 
         }
         if (reminder_id != 0 && error == PcmTtsPlayer::Error::kSuccess) {
             // The reminder is now awaiting a semantic response, not completed. Open the existing
-            // audio channel and start a manual-stop response session without a wake word.
+            // audio channel and start an automatic-stop response session without a wake word.
             StartReminderResponseListening();
             return;
         }
@@ -1782,8 +1780,7 @@ void Application::StartReminderResponseListening() {
             Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
             return;
         }
-        const auto mode = kUseManualStopForReminderResponse ? kListeningModeManualStop
-                                                            : kListeningModeAutoStop;
+        const auto mode = GetDefaultListeningMode();
         ESP_LOGI(TAG, "Reminder response listening mode: %s",
                  mode == kListeningModeManualStop ? "manual" : "auto");
         Schedule([this, mode]() { ContinueOpenAudioChannel(mode); });
@@ -1792,8 +1789,7 @@ void Application::StartReminderResponseListening() {
 
     ESP_LOGI(TAG, "Starting response listening for reminder %lu",
              static_cast<unsigned long>(waiting.id));
-    const auto mode = kUseManualStopForReminderResponse ? kListeningModeManualStop
-                                                        : kListeningModeAutoStop;
+    const auto mode = GetDefaultListeningMode();
     ESP_LOGI(TAG, "Reminder response listening mode: %s",
              mode == kListeningModeManualStop ? "manual" : "auto");
     SetListeningMode(mode);
