@@ -34,8 +34,8 @@ public:
     virtual void OnVadStateChange(std::function<void(bool speaking)> callback) = 0;
 
     virtual void EncodeWakeWordData() = 0;
-    // Discard cached pre-mute audio so it cannot be uploaded by a later manual wake.
-    virtual void ClearWakeWordData() {}
+    // Discard captured, buffered and cached microphone audio at a mute boundary.
+    virtual void ClearBufferedAudio() {}
     virtual bool GetWakeWordOpus(std::vector<uint8_t>& opus) = 0;
     virtual const std::string& GetLastDetectedWakeWord() const = 0;
 };
