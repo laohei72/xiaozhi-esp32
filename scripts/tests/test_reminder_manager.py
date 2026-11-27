@@ -229,6 +229,7 @@ void RunRelativeAndDue();
 void RunAbsoluteAndTimeSync();
 void RunMultiTaskAndOrdering();
 void RunPlayingLifecycle();
+void RunResponseLifecycle();
 void RunPlaybackFailedRetry();
 void RunCancel();
 void RunUpdate();
@@ -376,7 +377,7 @@ void RunMultiTaskAndOrdering() {
 DRIVER_SCENARIOS_C = r'''
 namespace {
 
-// 4. A playing task is not handed out twice, and the outcome decides completion or rescheduling.
+// 4. Successful playback opens a response window; only explicit confirmation completes a task.
 void RunPlayingLifecycle() {
     const int before = g_failures;
     std::printf("SCENARIO playing_lifecycle\n");
@@ -406,15 +407,26 @@ void RunPlayingLifecycle() {
           "lifecycle/last_fired_recorded",
           tasks.empty() ? "missing" : Num(tasks[0].last_fired_unix));
     Check(manager.TakeNextDueTask(task) && task.id == daily, "lifecycle/playing_task_skipped", "");
-    manager.MarkPlaying(daily);
 
     manager.OnPlaybackFinished(one_shot, PcmTtsPlayer::Error::kSuccess);
     tasks = manager.ListReminders();
+    Check(tasks.size() == 2 && tasks[0].state == ReminderState::kAwaitingResponse,
+          "lifecycle/one_shot_awaiting_response", tasks.empty() ? "missing" : StateOf(tasks[0]));
+    ReminderTask awaiting;
+    Check(manager.GetAwaitingResponseTask(awaiting) && awaiting.id == one_shot,
+          "lifecycle/active_response_task", "");
+    Check(manager.ResolveAwaitingResponse(true, 0, error), "lifecycle/explicit_complete", error);
+    tasks = manager.ListReminders();
     Check(tasks.size() == 2 && tasks[0].state == ReminderState::kCompleted,
           "lifecycle/one_shot_completed", tasks.empty() ? "missing" : StateOf(tasks[0]));
-    Check(tasks.size() == 2 && !tasks[0].recurring_active, "lifecycle/one_shot_not_recurring", "");
 
+    Check(manager.TakeNextDueTask(task) && task.id == daily, "lifecycle/daily_taken", "");
+    manager.MarkPlaying(daily);
     manager.OnPlaybackFinished(daily, PcmTtsPlayer::Error::kSuccess);
+    tasks = manager.ListReminders();
+    Check(tasks.size() == 2 && tasks[1].state == ReminderState::kAwaitingResponse,
+          "lifecycle/daily_awaiting_response", tasks.size() < 2 ? "missing" : StateOf(tasks[1]));
+    Check(manager.ResolveAwaitingResponse(true, 0, error), "lifecycle/daily_confirmed", error);
     tasks = manager.ListReminders();
     Check(tasks.size() == 2 && tasks[1].state == ReminderState::kPending,
           "lifecycle/daily_back_to_pending", tasks.size() < 2 ? "missing" : StateOf(tasks[1]));
@@ -430,7 +442,60 @@ void RunPlayingLifecycle() {
 DRIVER_SCENARIOS_D = r'''
 namespace {
 
-// 5. A failed or cancelled utterance leaves the task retryable instead of losing it.
+// 5. Snooze and no-response retries delay only that task; other due reminders can proceed.
+void RunResponseLifecycle() {
+    const int before = g_failures;
+    std::printf("SCENARIO response_lifecycle\\n");
+    ResetState();
+    ReminderManager manager;
+    std::string error;
+
+    const uint32_t first = manager.CreateReminder("先处理第一件事", ReminderType::kRelative,
+                                                  1000, 0, 0, 0, 0, 0, 0, error);
+    const uint32_t second = manager.CreateReminder("第二件事", ReminderType::kRelative,
+                                                   1000, 0, 0, 0, 0, 0, 0, error);
+    g_fake_time_us = 2000ULL * 1000;
+    Check(manager.MarkDueTasks() == 2, "response/both_due", "");
+
+    ReminderTask task;
+    Check(manager.TakeNextDueTask(task) && task.id == first, "response/first_taken", "");
+    manager.MarkPlaying(first);
+    manager.OnPlaybackFinished(first, PcmTtsPlayer::Error::kSuccess);
+    Check(manager.ResolveAwaitingResponse(false, 5000, error), "response/snoozed", error);
+    auto tasks = manager.ListReminders();
+    Check(tasks.size() == 2 && tasks[0].state == ReminderState::kDue,
+          "response/snooze_returns_due", tasks.empty() ? "missing" : StateOf(tasks[0]));
+    Check(!manager.GetAwaitingResponseTask(task), "response/no_longer_awaiting", "");
+
+    // The second task must not be blocked by the first task's snooze deadline.
+    Check(manager.TakeNextDueTask(task) && task.id == second, "response/second_not_blocked", "");
+    manager.MarkPlaying(second);
+    manager.OnPlaybackFinished(second, PcmTtsPlayer::Error::kSuccess);
+    Check(manager.ResolveAwaitingResponse(true, 0, error), "response/second_completed", error);
+
+    // The first task remains unavailable until its five-second snooze expires.
+    Check(!manager.TakeNextDueTask(task), "response/snooze_gate_active", "");
+    g_fake_time_us += 5000ULL * 1000;
+    Check(manager.TakeNextDueTask(task) && task.id == first, "response/snooze_expired", "");
+    manager.MarkPlaying(first);
+    manager.OnPlaybackFinished(first, PcmTtsPlayer::Error::kSuccess);
+
+    // No response returns it to due but applies a fresh retry delay.
+    Check(manager.RetryAwaitingResponse(first, 3000), "response/timeout_retry_scheduled", "");
+    Check(!manager.TakeNextDueTask(task), "response/timeout_gate_active", "");
+    g_fake_time_us += 3000ULL * 1000;
+    Check(manager.TakeNextDueTask(task) && task.id == first, "response/timeout_retried", "");
+    manager.MarkPlaying(first);
+    manager.OnPlaybackFinished(first, PcmTtsPlayer::Error::kSuccess);
+    Check(manager.ResolveAwaitingResponse(true, 0, error), "response/final_confirmation", error);
+    tasks = manager.ListReminders();
+    Check(tasks.size() == 2 && tasks[0].state == ReminderState::kCompleted,
+          "response/first_completed_only_after_confirmation",
+          tasks.empty() ? "missing" : StateOf(tasks[0]));
+    Finish("response_lifecycle", before);
+}
+
+// 6. A failed or cancelled utterance leaves the task retryable instead of losing it.
 void RunPlaybackFailedRetry() {
     const int before = g_failures;
     std::printf("SCENARIO playback_failed_retry\n");
@@ -473,8 +538,12 @@ void RunPlaybackFailedRetry() {
     manager.MarkPlaying(id);
     manager.OnPlaybackFinished(id, PcmTtsPlayer::Error::kSuccess);
     tasks = manager.ListReminders();
+    Check(tasks.size() == 1 && tasks[0].state == ReminderState::kAwaitingResponse,
+          "retry/success_awaits_response", tasks.empty() ? "missing" : StateOf(tasks[0]));
+    Check(manager.ResolveAwaitingResponse(true, 0, error), "retry/explicit_completion", error);
+    tasks = manager.ListReminders();
     Check(tasks.size() == 1 && tasks[0].state == ReminderState::kCompleted,
-          "retry/success_completes", tasks.empty() ? "missing" : StateOf(tasks[0]));
+          "retry/confirmed_completed", tasks.empty() ? "missing" : StateOf(tasks[0]));
     Finish("playback_failed_retry", before);
 }
 
@@ -669,6 +738,10 @@ void RunDailyRecurring() {
     manager.MarkPlaying(id);
     manager.OnPlaybackFinished(id, PcmTtsPlayer::Error::kSuccess);
     tasks = manager.ListReminders();
+    Check(tasks.size() == 1 && tasks[0].state == ReminderState::kAwaitingResponse,
+          "daily/awaiting_response", tasks.empty() ? "missing" : StateOf(tasks[0]));
+    Check(manager.ResolveAwaitingResponse(true, 0, error), "daily/explicit_confirmation", error);
+    tasks = manager.ListReminders();
     Check(tasks.size() == 1 && tasks[0].state == ReminderState::kPending,
           "daily/back_to_pending", tasks.empty() ? "missing" : StateOf(tasks[0]));
     Check(tasks.size() == 1 && tasks[0].recurring_active, "daily/still_active", "");
@@ -717,6 +790,10 @@ void RunWeeklyRecurring() {
     Check(manager.TakeNextDueTask(task) && task.id == id, "weekly/taken", "");
     manager.MarkPlaying(id);
     manager.OnPlaybackFinished(id, PcmTtsPlayer::Error::kSuccess);
+    tasks = manager.ListReminders();
+    Check(tasks.size() == 1 && tasks[0].state == ReminderState::kAwaitingResponse,
+          "weekly/awaiting_response", tasks.empty() ? "missing" : StateOf(tasks[0]));
+    Check(manager.ResolveAwaitingResponse(true, 0, error), "weekly/explicit_confirmation", error);
     tasks = manager.ListReminders();
     Check(tasks.size() == 1 && tasks[0].state == ReminderState::kPending && tasks[0].recurring_active,
           "weekly/rescheduled", tasks.empty() ? "missing" : StateOf(tasks[0]));
@@ -840,6 +917,15 @@ void RunPersistAndRestore() {
               "restart/playing_restored_as_due", tasks.empty() ? "missing" : StateOf(tasks[0]));
         Check(manager->TakeNextDueTask(task) && task.id == 4, "restart/playing_task_retried",
               std::to_string(task.id));
+    }
+    {
+        auto manager = init_from(
+            R"({"version":1,"tasks":[{"id":5,"text":"等待回应","type":"relative","state":"awaiting_response","trigger_ms":1000}]})");
+        tasks = manager->ListReminders();
+        Check(tasks.size() == 1 && tasks[0].state == ReminderState::kDue,
+              "restart/awaiting_response_replayed", tasks.empty() ? "missing" : StateOf(tasks[0]));
+        Check(manager->TakeNextDueTask(task) && task.id == 5,
+              "restart/awaiting_response_can_be_replayed", std::to_string(task.id));
     }
     {
         auto manager = init_from(absolute_json(kJan1 - 60, "pending"));
@@ -1009,6 +1095,8 @@ int main(int argc, char** argv) {
         RunMultiTaskAndOrdering();
     } else if (scenario == "playing_lifecycle") {
         RunPlayingLifecycle();
+    } else if (scenario == "response_lifecycle") {
+        RunResponseLifecycle();
     } else if (scenario == "playback_failed_retry") {
         RunPlaybackFailedRetry();
     } else if (scenario == "cancel") {
@@ -1135,8 +1223,11 @@ class ReminderManagerTest(unittest.TestCase):
     def test_due_tasks_are_handed_out_lowest_id_first(self):
         self._run("multi_task_and_ordering")
 
-    def test_playing_task_completes_or_reschedules(self):
+    def test_playing_task_enters_response_wait_until_explicit_confirmation(self):
         self._run("playing_lifecycle")
+
+    def test_response_completion_snooze_and_timeout_retry(self):
+        self._run("response_lifecycle")
 
     def test_failed_playback_keeps_the_task_retryable(self):
         self._run("playback_failed_retry")
