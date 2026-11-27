@@ -182,7 +182,9 @@ void Settings::EraseKey(const std::string& key) {
         return;
     }
     esp_err_t err = nvs_erase_key(nvs_handle_, key.c_str());
-    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+    if (err == ESP_OK) {
+        dirty_ = true;
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
         ESP_LOGE(TAG, "Failed to erase %s/%s: %s", ns_.c_str(), key.c_str(), esp_err_to_name(err));
     }
 }
