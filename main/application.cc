@@ -1562,6 +1562,23 @@ void Application::HandleReminderTick() {
     reminder_manager_.MarkDueTasks();
 
     if (reminder_chime_pending_) {
+        // A reminder may have been cancelled or rescheduled while its chime was interrupted.
+        // Do not replay even the chime for a task that is no longer due.
+        bool still_due = false;
+        for (const auto& current : reminder_manager_.ListReminders()) {
+            if (current.id == pending_reminder_task_.id &&
+                current.state == ReminderState::kDue) {
+                still_due = true;
+                break;
+            }
+        }
+        if (!still_due) {
+            reminder_chime_pending_ = false;
+            reminder_chime_start_pending_ = false;
+            ESP_LOGI(TAG, "Reminder chime retry skipped: reminder is no longer due");
+            return;
+        }
+
         // If a user interaction interrupted the chime or won the handoff race, retry it only
         // after the device and the shared playback path are completely idle.
         if (GetDeviceState() == kDeviceStateIdle && !reminder_chime_handoff_pending_ &&
