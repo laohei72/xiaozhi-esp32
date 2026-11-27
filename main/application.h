@@ -116,8 +116,8 @@ public:
 
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
-    // Starts the configured server-side greeting from idle; ignores all busy states.
-    void StartProactiveGreeting();
+    // Starts a server-side proactive interaction from idle; an empty context uses the configured greeting.
+    void StartProactiveGreeting(const std::string& context = "");
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
     bool CanEnterSleepMode();
     void SendMcpMessage(const std::string& payload);
@@ -169,6 +169,10 @@ private:
     // Reminder the active PCM utterance speaks, 0 when the session is the self test. The player's
     // result is fed back to the manager with this id when the session ends.
     uint32_t pcm_tts_reminder_id_ = 0;
+    // Reminder whose playback finished and whose user confirmation is being tested.
+    uint32_t pending_reminder_confirmation_id_ = 0;
+    // Text spoken by the active reminder PCM session, retained for the follow-up context.
+    std::string pcm_tts_reminder_text_;
     // Monotonic deadline (ms) before which a reminder whose utterance failed or was interrupted is
     // not retried, so a barge-in does not replay the task on the very next tick.
     uint64_t reminder_retry_not_before_ms_ = 0;
