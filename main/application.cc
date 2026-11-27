@@ -1137,6 +1137,11 @@ void Application::HandleWakeWordDetectedEvent() {
 }
 
 void Application::BeginWakeWordInvoke(const std::string& wake_word) {
+    // A manual/PIR invocation must not upload cached microphone audio while muted.
+    if (audio_service_.IsMicrophoneMuted()) {
+        ESP_LOGW(TAG, "Ignoring wake-word invocation while microphone is muted");
+        return;
+    }
     // Must run in the main task with the device in idle state
     audio_service_.EncodeWakeWord();
 
@@ -1782,7 +1787,8 @@ void Application::StartProactiveGreeting() {
     // PIR and board callbacks may run outside the main task. Only start a proactive
     // interaction when the device is truly idle; motion must never interrupt a user.
     Schedule([this, wake_word]() {
-        if (!protocol_ || GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy() ||
+        if (!protocol_ || audio_service_.IsMicrophoneMuted() ||
+            GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy() ||
             pcm_tts_player_.IsBusy() || !audio_service_.IsPlaybackIdle()) {
             ESP_LOGD(TAG, "Ignoring proactive greeting while device is busy");
             return;
