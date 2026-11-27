@@ -412,7 +412,7 @@ void RunPlayingLifecycle() {
     tasks = manager.ListReminders();
     Check(tasks.size() == 2 && tasks[0].state == ReminderState::kAwaitingResponse,
           "lifecycle/one_shot_awaiting_response", tasks.empty() ? "missing" : StateOf(tasks[0]));
-    Check(Settings::store["reminder_tasks/tasks_v1"].find("\\\"state\\\":\\\"playing\\\"") !=
+    Check(Settings::store["reminder_tasks/tasks_v1"].find("\"state\":\"playing\"") !=
               std::string::npos,
           "lifecycle/persisted_state_remains_rollback_compatible", "");
     ReminderTask awaiting;
