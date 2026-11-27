@@ -612,8 +612,9 @@ void AfeAudioEngine::EncodeWakeWordData() {
                 out.len = outbuf_size;
                 out.encoded_bytes = 0;
                 ret = esp_opus_enc_process(encoder_handle, &in, &out);
-                if (ret == ESP_AUDIO_ERR_OK &&
-                    cache_generation == engine->wake_word_cache_generation_.load()) {
+                if (ret != ESP_AUDIO_ERR_OK) {
+                    ESP_LOGE(TAG, "Failed to encode wake-word audio: %d", ret);
+                } else if (cache_generation == engine->wake_word_cache_generation_.load()) {
                     std::lock_guard<std::mutex> lock(engine->wake_word_mutex_);
                     if (cache_generation == engine->wake_word_cache_generation_.load()) {
                         engine->wake_word_opus_.emplace_back(opus_buf.data(),
@@ -621,12 +622,13 @@ void AfeAudioEngine::EncodeWakeWordData() {
                         engine->wake_word_cv_.notify_all();
                         ++packets;
                     }
-                } else {
-                    ESP_LOGE(TAG, "Failed to encode wake-word audio: %d", ret);
                 }
             }
 
-            engine->wake_word_audio_cache_.Clear();
+            // An obsolete encoder must not erase audio captured for a newer session.
+            if (cache_generation == engine->wake_word_cache_generation_.load()) {
+                engine->wake_word_audio_cache_.Clear();
+            }
             esp_opus_enc_close(encoder_handle);
             ESP_LOGI(TAG, "Encoded wake word into %d packets in %ld ms", packets,
                      static_cast<long>((esp_timer_get_time() - start_time) / 1000));
