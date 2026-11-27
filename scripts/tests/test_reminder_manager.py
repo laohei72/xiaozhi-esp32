@@ -1,3 +1,4 @@
+# CI validation trigger for the reminder response lifecycle tests.
 """Host tests for ReminderManager (the 4c timed voice reminder system).
 
 main/reminder/reminder_manager.cc is compiled unchanged against platform stubs (esp_timer,
