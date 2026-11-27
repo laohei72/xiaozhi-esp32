@@ -322,6 +322,53 @@ void Application::Run() {
                 pending_listening_start_ = false;
                 StartListeningAudio();
             }
+
+            // Hand the chime-to-TTS transition through Idle. StartPcmTtsSession()
+            // deliberately rejects every non-Idle state; do not weaken that guard.
+            if (reminder_chime_pending_ && !reminder_chime_start_pending_ &&
+                !reminder_chime_handoff_pending_ &&
+                GetDeviceState() == kDeviceStateSpeaking && audio_service_.IsPlaybackIdle() &&
+                !notify_player_.IsBusy() && !pcm_tts_player_.IsBusy()) {
+                reminder_chime_handoff_pending_ = true;
+                if (!SetDeviceState(kDeviceStateIdle)) {
+                    reminder_chime_handoff_pending_ = false;
+                    ESP_LOGW(TAG, "Could not enter idle after reminder chime");
+                } else {
+                    // STATE_CHANGED is handled before SCHEDULE in Run(). The callback
+                    // therefore runs only after the Idle handler has released audio processing.
+                    Schedule([this]() {
+                        reminder_chime_handoff_pending_ = false;
+                        ReminderTask current_task;
+                        bool still_due = false;
+                        for (const auto& current : reminder_manager_.ListReminders()) {
+                            if (current.id == pending_reminder_task_.id &&
+                                current.state == ReminderState::kDue) {
+                                current_task = current;
+                                still_due = true;
+                                break;
+                            }
+                        }
+                        if (!still_due) {
+                            reminder_chime_pending_ = false;
+                            reminder_chime_start_pending_ = false;
+                            ESP_LOGI(TAG, "Reminder chime handoff skipped: reminder is no longer due");
+                            return;
+                        }
+                        if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy() ||
+                            pcm_tts_player_.IsBusy() || !audio_service_.IsPlaybackIdle()) {
+                            // A user interaction won the race. Keep the due task and replay
+                            // the chime on a later clock tick rather than talking over them.
+                            pending_reminder_task_ = current_task;
+                            reminder_chime_pending_ = true;
+                            reminder_chime_start_pending_ = false;
+                            return;
+                        }
+                        reminder_chime_pending_ = false;
+                        reminder_chime_start_pending_ = false;
+                        StartReminderPlayback(current_task);
+                    });
+                }
+            }
         }
 
         if (bits & MAIN_EVENT_TOGGLE_CHAT) {
@@ -1214,6 +1261,10 @@ void Application::HandleStateChangedEvent() {
             if (!pcm_tts_player_.IsBusy()) {
                 audio_service_.ResetDecoder();
             }
+            if (reminder_chime_pending_ && reminder_chime_start_pending_) {
+                reminder_chime_start_pending_ = false;
+                audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
+            }
             break;
         case kDeviceStateNotifying:
             display->SetStatus(Lang::Strings::SPEAKING);
@@ -1502,10 +1553,25 @@ void Application::HandleReminderTick() {
     // and a recurring task is re-armed by OnPlaybackFinished() once it played.
     reminder_manager_.MarkDueTasks();
 
-    // Never talk over a conversation, a notification or another utterance. The task stays due, so
-    // nothing is lost by skipping it here.
+    if (reminder_chime_pending_) {
+        // If a user interaction interrupted the chime or won the handoff race, retry it only
+        // after the device and the shared playback path are completely idle.
+        if (GetDeviceState() == kDeviceStateIdle && !reminder_chime_handoff_pending_ &&
+            !notify_player_.IsBusy() && !pcm_tts_player_.IsBusy() &&
+            audio_service_.IsPlaybackIdle() &&
+            NowMonotonicMs() >= reminder_retry_not_before_ms_) {
+            reminder_chime_start_pending_ = true;
+            if (!SetDeviceState(kDeviceStateSpeaking)) {
+                reminder_chime_start_pending_ = false;
+                ESP_LOGW(TAG, "Failed to re-enter speaking state for reminder chime");
+            }
+        }
+        return;
+    }
+
+    // Never talk over a conversation, a notification or another utterance.
     if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy() ||
-        pcm_tts_player_.IsBusy()) {
+        pcm_tts_player_.IsBusy() || !audio_service_.IsPlaybackIdle()) {
         return;
     }
     if (NowMonotonicMs() < reminder_retry_not_before_ms_) {
@@ -1516,7 +1582,14 @@ void Application::HandleReminderTick() {
     if (!reminder_manager_.TakeNextDueTask(task)) {
         return;
     }
-    StartReminderPlayback(task);
+    pending_reminder_task_ = task;
+    reminder_chime_pending_ = true;
+    reminder_chime_start_pending_ = true;
+    if (!SetDeviceState(kDeviceStateSpeaking)) {
+        reminder_chime_pending_ = false;
+        reminder_chime_start_pending_ = false;
+        ESP_LOGW(TAG, "Failed to enter speaking state for reminder chime");
+    }
 }
 
 bool Application::StartReminderPlayback(const ReminderTask& task) {
