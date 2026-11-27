@@ -534,7 +534,18 @@ void AfeAudioEngine::OutputRawAudio(const std::vector<int16_t>& data) {
     }
 }
 
-void AfeAudioEngine::ClearWakeWordData() {
+void AfeAudioEngine::ClearBufferedAudio() {
+    // Invalidate a fetch already in progress; ProcessingTask owns the actual AFE ring-buffer reset.
+    control_generation_.fetch_add(1);
+    {
+        std::lock_guard<std::mutex> lock(input_buffer_mutex_);
+        input_buffer_.clear();
+    }
+    if (afe_data_ != nullptr) {
+        reset_pending_.store(true);
+    }
+    output_reset_pending_.store(true);
+
     wake_word_cache_generation_.fetch_add(1);
     wake_word_audio_cache_.Clear();
     std::lock_guard<std::mutex> lock(wake_word_mutex_);
