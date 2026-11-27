@@ -29,11 +29,20 @@
 
 
 #define BUILTIN_LED_GPIO        GPIO_NUM_48
+
+// External controls: all button inputs are active-low and use internal pull-ups.
 #define PIR_SENSOR_GPIO         GPIO_NUM_8
+#define FUNCTION_BUTTON_GPIO    GPIO_NUM_9
+#define MIC_MUTE_BUTTON_GPIO    GPIO_NUM_10
+
+// Existing on-board controls: do not repurpose these pins.
 #define BOOT_BUTTON_GPIO        GPIO_NUM_0
 #define TOUCH_BUTTON_GPIO       GPIO_NUM_47
 #define VOLUME_UP_BUTTON_GPIO   GPIO_NUM_40
 #define VOLUME_DOWN_BUTTON_GPIO GPIO_NUM_39
+
+// Reserved expansion GPIOs (kept unassigned in this hardware revision).
+// GPIO11-14, GPIO17 and GPIO21 remain available for future peripherals.
 
 #define DISPLAY_SDA_PIN GPIO_NUM_41
 #define DISPLAY_SCL_PIN GPIO_NUM_42
