@@ -996,7 +996,7 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
             if (reminder_response_listening_) {
                 ReminderTask waiting;
                 if (reminder_manager_.GetAwaitingResponseTask(waiting)) {
-                    reminder_manager_.RetryAwaitingResponse(waiting.id, kReminderRetryDelayMs);
+                    reminder_manager_.DeferAwaitingResponse(waiting.id, kReminderRetryDelayMs);
                 }
                 reminder_response_listening_ = false;
                 reminder_response_resolution_pending_ = false;
@@ -1557,8 +1557,11 @@ void Application::HandleReminderTick() {
                        now >= reminder_response_deadline_ms_) {
                 ESP_LOGI(TAG, "No response to reminder %lu; retrying later",
                          static_cast<unsigned long>(awaiting_response.id));
-                reminder_manager_.RetryAwaitingResponse(awaiting_response.id,
-                                                        kReminderRetryDelayMs);
+                if (!reminder_manager_.RetryAwaitingResponse(awaiting_response.id,
+                                                            kReminderRetryDelayMs)) {
+                    ESP_LOGW(TAG, "Reminder %lu paused after two automatic retries",
+                             static_cast<unsigned long>(awaiting_response.id));
+                }
                 reminder_response_listening_ = false;
                 reminder_response_resolution_pending_ = false;
                 reminder_response_deadline_ms_ = 0;
@@ -1584,7 +1587,7 @@ void Application::HandleReminderTick() {
         } else if (state == kDeviceStateIdle) {
             // Listening was closed unexpectedly (for example, a network interruption).
             if (has_awaiting_response) {
-                reminder_manager_.RetryAwaitingResponse(awaiting_response.id, kReminderRetryDelayMs);
+                reminder_manager_.DeferAwaitingResponse(awaiting_response.id, kReminderRetryDelayMs);
             }
             reminder_response_listening_ = false;
             reminder_response_resolution_pending_ = false;
@@ -1699,7 +1702,7 @@ void Application::StartReminderResponseListening() {
     if (protocol_ == nullptr) {
         ESP_LOGW(TAG, "Cannot listen for reminder %lu response: protocol unavailable",
                  static_cast<unsigned long>(waiting.id));
-        reminder_manager_.RetryAwaitingResponse(waiting.id, kReminderRetryDelayMs);
+        reminder_manager_.DeferAwaitingResponse(waiting.id, kReminderRetryDelayMs);
         reminder_response_listening_ = false;
         reminder_response_resolution_pending_ = false;
         Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
@@ -1710,7 +1713,7 @@ void Application::StartReminderResponseListening() {
     Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
     if (!protocol_->IsAudioChannelOpened()) {
         if (!SetDeviceState(kDeviceStateConnecting)) {
-            reminder_manager_.RetryAwaitingResponse(waiting.id, kReminderRetryDelayMs);
+            reminder_manager_.DeferAwaitingResponse(waiting.id, kReminderRetryDelayMs);
             reminder_response_listening_ = false;
             reminder_response_resolution_pending_ = false;
             Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
