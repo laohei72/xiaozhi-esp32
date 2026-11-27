@@ -356,7 +356,8 @@ void RegisterReminderTools(ReminderManager& manager) {
         "another time. The arguments are the ones of `self.reminders.create` plus `id`, so the "
         "schedule must be sent in full again: read the current one with `self.reminders.list` "
         "first. Leave `text` out to keep the current text. A one-shot reminder that already played "
-        "comes back and plays again at the new time.",
+        "comes back and plays again at the new time. If the task is currently `awaiting_response`, "
+        "use `self.reminders.respond` with action `snooze` instead of changing its schedule.",
         UpdateProperties(), [&manager](const PropertyList& properties) -> ToolResult {
             Schedule schedule;
             std::string error = BuildScheduleFromProperties(properties, schedule);
@@ -375,8 +376,9 @@ void RegisterReminderTools(ReminderManager& manager) {
         });
 
     mcp_server.AddTool("self.reminders.cancel",
-                       "Cancel one reminder by `id`. Read the id with `self.reminders.list` first; "
-                       "never guess it.",
+                       "Cancel one reminder by `id` only when the user explicitly asks to cancel it. Read the id "
+                       "with `self.reminders.list` first; never guess it. Do not use cancel to mark a "
+                       "reminder as handled; use `self.reminders.respond` with action `complete`.",
                        PropertyList({Property("id", kPropertyTypeInteger, 1,
                                               std::numeric_limits<int>::max())}),
                        [&manager](const PropertyList& properties) -> ToolResult {
