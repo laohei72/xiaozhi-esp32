@@ -25,6 +25,7 @@ enum class ReminderState {
     kAwaitingResponse, // 播报完成，等待用户明确回应
     kCompleted,  // 已完成
     kCancelled,  // 已取消
+    kPaused,     // 自动重播次数耗尽，等待用户主动处理
 };
 
 struct ReminderTask {
@@ -37,6 +38,7 @@ struct ReminderTask {
     int64_t trigger_unix = 0;        // 绝对/每天/每周：下次触发的 Unix 秒
     uint64_t created_ms = 0;         // 创建时的 esp_timer_get_time()/1000
     uint64_t retry_not_before_ms = 0; // 仅运行期：超时/稍后提醒的重播门限，不写入 NVS
+    uint8_t retry_count = 0;           // 自动重播次数，持久化到 NVS
     int64_t last_fired_unix = 0;     // 最近一次触发完成的 Unix 秒，0 表示从未触发
     // 周期规则参数
     int daily_hour = 0;      // 0-23，kDaily 用
@@ -111,12 +113,15 @@ public:
     // A successful utterance starts a response window; it does not complete the reminder.
     void OnPlaybackFinished(uint32_t id, PcmTtsPlayer::Error error);
     bool GetAwaitingResponseTask(ReminderTask& out) const;
-    // Resolves the sole reminder awaiting a response. Snooze returns it to due after delay_ms.
-    bool ResolveAwaitingResponse(bool completed, uint64_t delay_ms, std::string& out_error);
-    // No response (or an interrupted response window): retry the reminder after delay_ms.
+    // Resolves the specified awaiting/paused reminder. Snooze returns it to due after delay_ms.
+    bool ResolveReminderResponse(uint32_t id, bool completed, uint64_t delay_ms,
+                                 std::string& out_error);
+    // A genuine response timeout increments retry_count; after two retries the task is paused.
     bool RetryAwaitingResponse(uint32_t id, uint64_t delay_ms);
+    // Defers an awaiting task after an infrastructure/listening failure without consuming a retry.
+    bool DeferAwaitingResponse(uint32_t id, uint64_t delay_ms);
 
-    // "pending"/"due"/"playing"/"awaiting_response"/"completed"/"cancelled".
+    // "pending"/"due"/"playing"/"awaiting_response"/"completed"/"cancelled"/"paused".
     static const char* StateName(ReminderState state);
     // "relative"/"absolute"/"daily"/"weekly".
     static const char* TypeName(ReminderType type);
