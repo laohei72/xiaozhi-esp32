@@ -1687,7 +1687,12 @@ void Application::HandlePcmTtsFinished(uint32_t session_id, PcmTtsPlayer::Error 
 
 void Application::StartReminderResponseListening() {
     ReminderTask waiting;
-    if (!reminder_manager_.GetAwaitingResponseTask(waiting)) return;
+    if (!reminder_manager_.GetAwaitingResponseTask(waiting)) {
+        reminder_response_listening_ = false;
+        reminder_response_resolution_pending_ = false;
+        Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        return;
+    }
 
     reminder_response_deadline_ms_ = 0;
     reminder_response_resolution_pending_ = false;
