@@ -6,6 +6,8 @@ public:
     virtual ~Led() = default;
     // Set the led state based on the device state
     virtual void OnStateChanged() = 0;
+    // Optional status overlay for boards with a controllable status LED.
+    virtual void SetMicrophoneMuted(bool muted) { (void)muted; }
 };
 
 
