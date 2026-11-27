@@ -25,6 +25,10 @@
 
 #define TAG "Application"
 
+// Temporary reminder-response transport diagnostics; remove this define and guarded logging
+// after the server session behavior has been verified.
+#define REMINDER_RESPONSE_DIAG 1
+
 namespace {
 
 // Stage-4b self test: a fixed Chinese sentence rendered by Baidu TTS, streamed through the same
@@ -64,6 +68,8 @@ constexpr uint64_t kReminderRetryDelayMs = 30 * 1000;
 // detected, allow the server up to 60 seconds after the last voice activity to process and answer.
 // The listening window is reopened after every assistant response, with no turn-count limit.
 constexpr uint64_t kReminderResponseProcessingTimeoutMs = 60 * 1000;
+// Temporary experiment: only reminder-response listening uses manual-stop mode.
+constexpr bool kUseManualStopForReminderResponse = true;
 
 // Reminder schedule fields are local time, while the firmware clock is UTC until a zone is set (the
 // time itself comes from the OTA server, there is no SNTP client). The zone therefore comes from
@@ -346,14 +352,34 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
-                if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
-                    // Drop the remaining packets. Leaving them in the queue would
-                    // stall the Opus codec task (it waits for queue space), which in
-                    // turn deadlocks the whole audio input pipeline, as no new
-                    // MAIN_EVENT_SEND_AUDIO event would ever be triggered again.
-                    while (audio_service_.PopPacketFromSendQueue())
-                        ;
-                    break;
+#ifdef REMINDER_RESPONSE_DIAG
+                if (reminder_response_listening_) reminder_audio_popped_++;
+#endif
+                if (protocol_) {
+                    const bool sent = protocol_->SendAudio(std::move(packet));
+#ifdef REMINDER_RESPONSE_DIAG
+                    if (reminder_response_listening_) {
+                        reminder_audio_attempted_++;
+                        if (sent) reminder_audio_sent_++;
+                        else reminder_audio_failed_++;
+                    }
+#endif
+                    if (!sent) {
+                        // Drop the remaining packets. Leaving them in the queue would
+                        // stall the Opus codec task (it waits for queue space), which in
+                        // turn deadlocks the whole audio input pipeline, as no new
+                        // MAIN_EVENT_SEND_AUDIO event would ever be triggered again.
+                        while (audio_service_.PopPacketFromSendQueue()) {
+#ifdef REMINDER_RESPONSE_DIAG
+                            if (reminder_response_listening_) reminder_audio_discarded_++;
+#endif
+                        }
+                        break;
+                    }
+                } else {
+#ifdef REMINDER_RESPONSE_DIAG
+                    if (reminder_response_listening_) reminder_audio_discarded_++;
+#endif
                 }
             }
         }
@@ -390,6 +416,19 @@ void Application::Run() {
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
                 SystemInfo::PrintHeapStats();
+#ifdef REMINDER_RESPONSE_DIAG
+                if (reminder_response_listening_) {
+                    ESP_LOGI(TAG,
+                             "Reminder audio uplink 10s: popped=%lu attempted=%lu sent=%lu failed=%lu discarded=%lu",
+                             static_cast<unsigned long>(reminder_audio_popped_),
+                             static_cast<unsigned long>(reminder_audio_attempted_),
+                             static_cast<unsigned long>(reminder_audio_sent_),
+                             static_cast<unsigned long>(reminder_audio_failed_),
+                             static_cast<unsigned long>(reminder_audio_discarded_));
+                    reminder_audio_popped_ = reminder_audio_attempted_ = 0;
+                    reminder_audio_sent_ = reminder_audio_failed_ = reminder_audio_discarded_ = 0;
+                }
+#endif
                 // SystemInfo::PrintTaskList();
                 // SystemInfo::PrintTaskCpuUsage(pdMS_TO_TICKS(1000));
             }
@@ -1704,6 +1743,10 @@ void Application::StartReminderResponseListening() {
 
     reminder_response_deadline_ms_ = 0;
     reminder_response_resolution_pending_ = false;
+#ifdef REMINDER_RESPONSE_DIAG
+    reminder_audio_popped_ = reminder_audio_attempted_ = 0;
+    reminder_audio_sent_ = reminder_audio_failed_ = reminder_audio_discarded_ = 0;
+#endif
     if (protocol_ == nullptr) {
         ESP_LOGW(TAG, "Cannot listen for reminder %lu response: protocol unavailable",
                  static_cast<unsigned long>(waiting.id));
@@ -1724,13 +1767,21 @@ void Application::StartReminderResponseListening() {
             Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
             return;
         }
-        Schedule([this]() { ContinueOpenAudioChannel(kListeningModeAutoStop); });
+        const auto mode = kUseManualStopForReminderResponse ? kListeningModeManualStop
+                                                            : kListeningModeAutoStop;
+        ESP_LOGI(TAG, "Reminder response listening mode: %s",
+                 mode == kListeningModeManualStop ? "manual" : "auto");
+        Schedule([this, mode]() { ContinueOpenAudioChannel(mode); });
         return;
     }
 
     ESP_LOGI(TAG, "Starting response listening for reminder %lu",
              static_cast<unsigned long>(waiting.id));
-    SetListeningMode(kListeningModeAutoStop);
+    const auto mode = kUseManualStopForReminderResponse ? kListeningModeManualStop
+                                                        : kListeningModeAutoStop;
+    ESP_LOGI(TAG, "Reminder response listening mode: %s",
+             mode == kListeningModeManualStop ? "manual" : "auto");
+    SetListeningMode(mode);
 }
 
 void Application::Schedule(std::function<void()>&& callback) {
