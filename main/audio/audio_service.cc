@@ -532,34 +532,47 @@ void AudioService::OpusCodecTask() {
                     .encoded_bytes = 0,
                 };
                 auto ret = esp_opus_enc_process(opus_encoder_, &in, &out);
-                if (ret == ESP_AUDIO_ERR_OK && !microphone_muted_.load() &&
-                    mute_generation == microphone_mute_generation_.load()) {
-                    packet->payload.resize(out.encoded_bytes);
-
-                    if (task.type == kAudioTaskTypeEncodeToSendQueue) {
-                        {
+                if (ret == ESP_AUDIO_ERR_OK) {
+                    bool queued = false;
+                    if (!microphone_muted_.load() &&
+                        mute_generation == microphone_mute_generation_.load()) {
+                        packet->payload.resize(out.encoded_bytes);
+                        if (task.type == kAudioTaskTypeEncodeToSendQueue) {
                             std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
-                            /* Never let a full send queue stall encoding: stale realtime
-                             * audio is useless to the server, so drop the oldest packet. */
-                            if (audio_send_queue_.size() >= MAX_SEND_PACKETS_IN_QUEUE) {
-                                audio_send_queue_.pop_front();
+                            // Recheck under the queue lock: mute may have started after encoding.
+                            if (!microphone_muted_.load() &&
+                                mute_generation == microphone_mute_generation_.load()) {
+                                /* Never let a full send queue stall encoding: stale realtime
+                                 * audio is useless to the server, so drop the oldest packet. */
+                                if (audio_send_queue_.size() >= MAX_SEND_PACKETS_IN_QUEUE) {
+                                    audio_send_queue_.pop_front();
+                                }
+                                audio_send_queue_.push_back(std::move(packet));
+                                queued = true;
                             }
-                            audio_send_queue_.push_back(std::move(packet));
-                        }
-                        if (callbacks_.on_send_queue_available) {
-                            callbacks_.on_send_queue_available();
-                        }
-                    } else if (task.type == kAudioTaskTypeEncodeToTestingQueue) {
-                        bool testing_queue_full = false;
-                        {
-                            std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
-                            testing_queue_full = !audio_testing_queue_.push_back(std::move(packet));
-                        }
-                        if (testing_queue_full && callbacks_.on_audio_testing_queue_full) {
-                            callbacks_.on_audio_testing_queue_full();
+                        } else if (task.type == kAudioTaskTypeEncodeToTestingQueue) {
+                            bool testing_queue_full = false;
+                            {
+                                std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
+                                if (!microphone_muted_.load() &&
+                                    mute_generation == microphone_mute_generation_.load()) {
+                                    testing_queue_full =
+                                        !audio_testing_queue_.push_back(std::move(packet));
+                                    queued = !testing_queue_full;
+                                }
+                            }
+                            if (testing_queue_full && callbacks_.on_audio_testing_queue_full) {
+                                callbacks_.on_audio_testing_queue_full();
+                            }
                         }
                     }
-                    debug_statistics_.encode_count++;
+                    if (queued) {
+                        if (task.type == kAudioTaskTypeEncodeToSendQueue &&
+                            callbacks_.on_send_queue_available) {
+                            callbacks_.on_send_queue_available();
+                        }
+                        debug_statistics_.encode_count++;
+                    }
                 } else {
                     ESP_LOGE(TAG, "Failed to encode audio, error code: %d", ret);
                 }
@@ -842,7 +855,13 @@ void AudioService::SetMicrophoneMuted(bool muted) {
         audio_engine_->ClearWakeWordData();
     }
     if (!muted) {
-        // Discard the first input interval after I2S RX is restarted.
+        // Discard resampler history and the first input interval after I2S RX is restarted.
+        {
+            std::lock_guard<std::mutex> lock(input_resampler_mutex_);
+            if (input_resampler_ != nullptr) {
+                esp_ae_rate_cvt_reset(input_resampler_);
+            }
+        }
         audio_input_need_warmup_.store(true);
     }
 }
