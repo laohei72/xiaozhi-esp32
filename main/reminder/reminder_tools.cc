@@ -335,7 +335,7 @@ void RegisterReminderTools(ReminderManager& manager) {
         PropertyList({
             Property("id", kPropertyTypeInteger, 1, 65535),
             Property("action", kPropertyTypeString),
-            Property("delay_seconds", kPropertyTypeInteger, 1, 7 * 24 * 60 * 60),
+            Property("delay_seconds", kPropertyTypeInteger, 0, 0, 7 * 24 * 60 * 60),
         }),
         [&manager](const PropertyList& properties) -> ToolResult {
             const uint32_t id = static_cast<uint32_t>(properties["id"].value<int>());
