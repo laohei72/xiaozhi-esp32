@@ -14,6 +14,7 @@
 #include <driver/i2c_master.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
+#include <esp_timer.h>
 
 #ifdef SH1106
 #include <esp_lcd_panel_sh1106.h>
@@ -31,6 +32,69 @@ private:
     Button touch_button_;
     Button volume_up_button_;
     Button volume_down_button_;
+    esp_timer_handle_t pir_poll_timer_ = nullptr;
+    int pir_last_level_ = 0;
+    int64_t pir_high_since_us_ = 0;
+    int64_t pir_last_trigger_us_ = 0;
+    bool pir_high_triggered_ = false;
+
+    void InitializePirSensor() {
+        gpio_config_t config = {};
+        config.pin_bit_mask = 1ULL << PIR_SENSOR_GPIO;
+        config.mode = GPIO_MODE_INPUT;
+        config.pull_up_en = GPIO_PULLUP_DISABLE;
+        config.pull_down_en = GPIO_PULLDOWN_ENABLE;
+        config.intr_type = GPIO_INTR_DISABLE;
+        ESP_ERROR_CHECK(gpio_config(&config));
+
+        pir_last_level_ = gpio_get_level(PIR_SENSOR_GPIO);
+        if (pir_last_level_ != 0) {
+            // Ignore a high level during the sensor's power-on stabilization period.
+            pir_high_since_us_ = esp_timer_get_time();
+            pir_high_triggered_ = true;
+        }
+
+        esp_timer_create_args_t timer_args = {
+            .callback = [](void* arg) {
+                auto* board = static_cast<CompactWifiBoard*>(arg);
+                const int level = gpio_get_level(PIR_SENSOR_GPIO);
+                const int64_t now = esp_timer_get_time();
+                constexpr int64_t kStableHighUs = 2500LL * 1000;
+                constexpr int64_t kCooldownUs = 20LL * 1000 * 1000;
+
+                if (level != 0) {
+                    if (board->pir_last_level_ == 0) {
+                        board->pir_high_since_us_ = now;
+                        board->pir_high_triggered_ = false;
+                    }
+                    if (!board->pir_high_triggered_ && board->pir_high_since_us_ != 0 &&
+                        now - board->pir_high_since_us_ >= kStableHighUs) {
+                        board->pir_high_triggered_ = true;
+                        if (board->pir_last_trigger_us_ == 0 ||
+                            now - board->pir_last_trigger_us_ >= kCooldownUs) {
+                            board->pir_last_trigger_us_ = now;
+                            ESP_LOGI(TAG, "PIR motion detected");
+#if defined(CONFIG_CUSTOM_WAKE_WORD_DISPLAY)
+                            Application::GetInstance().WakeWordInvoke(CONFIG_CUSTOM_WAKE_WORD_DISPLAY);
+#else
+                            Application::GetInstance().WakeWordInvoke("小智小智");
+#endif
+                        }
+                    }
+                } else {
+                    board->pir_high_since_us_ = 0;
+                    board->pir_high_triggered_ = false;
+                }
+                board->pir_last_level_ = level;
+            },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "pir_poll",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &pir_poll_timer_));
+        ESP_ERROR_CHECK(esp_timer_start_periodic(pir_poll_timer_, 100 * 1000));
+    }
 
     void InitializeDisplayI2c() {
         i2c_master_bus_config_t bus_config = {
@@ -171,6 +235,7 @@ public:
         InitializeDisplayI2c();
         InitializeSsd1306Display();
         InitializeButtons();
+        InitializePirSensor();
         InitializeTools();
     }
 
