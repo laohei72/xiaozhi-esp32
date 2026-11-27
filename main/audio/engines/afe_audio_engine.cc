@@ -534,6 +534,14 @@ void AfeAudioEngine::OutputRawAudio(const std::vector<int16_t>& data) {
     }
 }
 
+void AfeAudioEngine::ClearWakeWordData() {
+    wake_word_cache_generation_.fetch_add(1);
+    wake_word_audio_cache_.Clear();
+    std::lock_guard<std::mutex> lock(wake_word_mutex_);
+    wake_word_opus_.clear();
+    wake_word_cv_.notify_all();
+}
+
 void AfeAudioEngine::EncodeWakeWordData() {
     if (wake_detector_ == WakeDetector::kMultiNet) {
         custom_wake_word_->EncodeWakeWordData();
@@ -585,10 +593,12 @@ void AfeAudioEngine::EncodeWakeWordData() {
             esp_audio_enc_in_frame_t in = {};
             esp_audio_enc_out_frame_t out = {};
 
+            const uint32_t cache_generation = engine->wake_word_cache_generation_.load();
             const size_t cached_samples = engine->wake_word_audio_cache_.Size();
             for (size_t offset = 0; offset + static_cast<size_t>(frame_size) <= cached_samples;
                  offset += frame_size) {
-                if (engine->wake_word_audio_cache_.Read(offset, input.data(), frame_size) !=
+                if (cache_generation != engine->wake_word_cache_generation_.load() ||
+                    engine->wake_word_audio_cache_.Read(offset, input.data(), frame_size) !=
                     static_cast<size_t>(frame_size)) {
                     break;
                 }
@@ -599,12 +609,15 @@ void AfeAudioEngine::EncodeWakeWordData() {
                 out.len = outbuf_size;
                 out.encoded_bytes = 0;
                 ret = esp_opus_enc_process(encoder_handle, &in, &out);
-                if (ret == ESP_AUDIO_ERR_OK) {
+                if (ret == ESP_AUDIO_ERR_OK &&
+                    cache_generation == engine->wake_word_cache_generation_.load()) {
                     std::lock_guard<std::mutex> lock(engine->wake_word_mutex_);
-                    engine->wake_word_opus_.emplace_back(opus_buf.data(),
-                                                         opus_buf.data() + out.encoded_bytes);
-                    engine->wake_word_cv_.notify_all();
-                    ++packets;
+                    if (cache_generation == engine->wake_word_cache_generation_.load()) {
+                        engine->wake_word_opus_.emplace_back(opus_buf.data(),
+                                                             opus_buf.data() + out.encoded_bytes);
+                        engine->wake_word_cv_.notify_all();
+                        ++packets;
+                    }
                 } else {
                     ESP_LOGE(TAG, "Failed to encode wake-word audio: %d", ret);
                 }
