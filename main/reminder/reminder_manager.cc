@@ -577,6 +577,7 @@ bool ReminderManager::UpdateReminder(uint32_t id, const std::string& text, Remin
     if (!text.empty()) updated.text = text;
     updated.state = ReminderState::kPending;
     updated.retry_not_before_ms = 0;
+    updated.retry_count = 0;
     *task = updated;
     SaveLocked();
     ESP_LOGI(TAG, "Updated reminder %u (%s): %s", id, TypeName(type), updated.text.c_str());
