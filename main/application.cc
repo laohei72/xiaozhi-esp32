@@ -60,9 +60,9 @@ std::unique_ptr<Http> CreateBaiduTtsHttp() {
 // the next one: the usual cause is a barge-in, and replaying it immediately would talk over the
 // user.
 constexpr uint64_t kReminderRetryDelayMs = 30 * 1000;
-// After a reminder, wait 20 seconds for the first response. Once speech is detected, allow
-// the server up to 60 seconds to transcribe, reason and answer before reopening the window.
-constexpr uint64_t kReminderResponseTimeoutMs = 30 * 1000;
+// Keep reminder response listening open indefinitely while the user is silent. Once speech is
+// detected, allow the server up to 60 seconds after the last voice activity to process and answer.
+// The listening window is reopened after every assistant response, with no turn-count limit.
 constexpr uint64_t kReminderResponseProcessingTimeoutMs = 60 * 1000;
 
 // Reminder schedule fields are local time, while the firmware clock is UTC until a zone is set (the
@@ -1340,7 +1340,9 @@ void Application::StartListeningAudio() {
     if (reminder_response_listening_) {
         ReminderTask waiting;
         if (reminder_manager_.GetAwaitingResponseTask(waiting)) {
-            reminder_response_deadline_ms_ = NowMonotonicMs() + kReminderResponseTimeoutMs;
+            // No speech deadline: keep listening until the user speaks or resolves the reminder.
+            // Each assistant TTS completion returns here and starts another unlimited turn.
+            reminder_response_deadline_ms_ = 0;
             ESP_LOGI(TAG, "Listening for response to reminder %lu",
                      static_cast<unsigned long>(waiting.id));
         } else {
@@ -1552,14 +1554,17 @@ void Application::HandleReminderTick() {
         const uint64_t now = NowMonotonicMs();
         if (state == kDeviceStateListening && has_awaiting_response) {
             if (audio_service_.IsVoiceDetected()) {
+                // Refresh only while the user is speaking. After speech stops, the server gets
+                // the full processing window; silence before any new speech never expires the
+                // reminder response session.
                 reminder_response_deadline_ms_ = now + kReminderResponseProcessingTimeoutMs;
             } else if (reminder_response_deadline_ms_ != 0 &&
                        now >= reminder_response_deadline_ms_) {
-                ESP_LOGI(TAG, "No response to reminder %lu; retrying later",
+                ESP_LOGW(TAG, "Reminder %lu response processing timed out",
                          static_cast<unsigned long>(awaiting_response.id));
                 if (!reminder_manager_.RetryAwaitingResponse(awaiting_response.id,
                                                             kReminderRetryDelayMs)) {
-                    ESP_LOGW(TAG, "Reminder %lu paused after two automatic retries",
+                    ESP_LOGW(TAG, "Reminder %lu paused after two processing retries",
                              static_cast<unsigned long>(awaiting_response.id));
                 }
                 reminder_response_listening_ = false;
