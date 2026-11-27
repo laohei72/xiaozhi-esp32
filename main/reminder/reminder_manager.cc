@@ -560,6 +560,7 @@ bool ReminderManager::UpdateReminder(uint32_t id, const std::string& text, Remin
     if (!out_error.empty()) return false;
     if (!text.empty()) updated.text = text;
     updated.state = ReminderState::kPending;
+    updated.retry_not_before_ms = 0;
     *task = updated;
     SaveLocked();
     ESP_LOGI(TAG, "Updated reminder %u (%s): %s", id, TypeName(type), updated.text.c_str());
@@ -658,6 +659,7 @@ void ReminderManager::MarkPlaying(uint32_t id) {
         return;
     }
     task->state = ReminderState::kPlaying;
+    task->retry_not_before_ms = 0;
     const int64_t now_unix = NowUnixSeconds();
     if (now_unix > kMinTrustedUnix) task->last_fired_unix = now_unix;
     SaveLocked();
@@ -762,6 +764,7 @@ bool ReminderManager::ResolveAwaitingResponse(bool completed, uint64_t delay_ms,
     } else {
         task->state = ReminderState::kCompleted;
         task->recurring_active = false;
+        task->retry_not_before_ms = 0;
         ESP_LOGI(TAG, "Reminder %u explicitly completed", task->id);
     }
     SaveLocked();
