@@ -105,6 +105,7 @@ struct AudioTask {
     AudioTaskType type;
     std::vector<int16_t> pcm;
     uint32_t timestamp = 0;
+    uint32_t microphone_generation = 0;
     uint32_t playback_id = 0;
     uint32_t media_position_ms = 0;
 };
