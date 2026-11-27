@@ -1724,7 +1724,7 @@ void Application::HandlePcmTtsFinished(uint32_t session_id, PcmTtsPlayer::Error 
         }
         if (reminder_id != 0 && error == PcmTtsPlayer::Error::kSuccess) {
             // The reminder is now awaiting a semantic response, not completed. Open the existing
-            // audio channel and start one auto-stop utterance without sending a wake word.
+            // audio channel and start a manual-stop response session without a wake word.
             StartReminderResponseListening();
             return;
         }
