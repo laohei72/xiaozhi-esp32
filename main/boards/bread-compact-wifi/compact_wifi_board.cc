@@ -165,7 +165,12 @@ Application::GetInstance().StartProactiveGreeting();
     void InitializeButtons() {
         function_button_.OnClick([this]() {
             // A short press manually starts the normal wake-word interaction.
-            Application::GetInstance().WakeWordInvoke("小智小智");
+            auto& app = Application::GetInstance();
+            if (app.GetAudioService().IsMicrophoneMuted()) {
+                GetDisplay()->ShowNotification("请先解除麦克风静音");
+                return;
+            }
+            app.WakeWordInvoke("小智小智");
         });
         function_button_.OnDoubleClick([this]() {
             ReconnectWifi();
