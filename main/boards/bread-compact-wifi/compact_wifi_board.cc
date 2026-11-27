@@ -74,11 +74,7 @@ private:
                             now - board->pir_last_trigger_us_ >= kCooldownUs) {
                             board->pir_last_trigger_us_ = now;
                             ESP_LOGI(TAG, "PIR motion detected");
-#if defined(CONFIG_CUSTOM_WAKE_WORD_DISPLAY)
-                            Application::GetInstance().WakeWordInvoke(CONFIG_CUSTOM_WAKE_WORD_DISPLAY);
-#else
-                            Application::GetInstance().WakeWordInvoke("小智小智");
-#endif
+Application::GetInstance().StartProactiveGreeting();
                         }
                     }
                 } else {
