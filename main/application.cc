@@ -1768,6 +1768,25 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
     }
 }
 
+void Application::StartProactiveGreeting() {
+#if defined(CONFIG_CUSTOM_WAKE_WORD_DISPLAY)
+    const std::string wake_word = CONFIG_CUSTOM_WAKE_WORD_DISPLAY;
+#else
+    const std::string wake_word = "小智小智";
+#endif
+    // PIR and board callbacks may run outside the main task. Only start a proactive
+    // interaction when the device is truly idle; motion must never interrupt a user.
+    Schedule([this, wake_word]() {
+        if (!protocol_ || GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy() ||
+            pcm_tts_player_.IsBusy() || !audio_service_.IsPlaybackIdle()) {
+            ESP_LOGD(TAG, "Ignoring proactive greeting while device is busy");
+            return;
+        }
+        ESP_LOGI(TAG, "Starting proactive greeting");
+        BeginWakeWordInvoke(wake_word);
+    });
+}
+
 void Application::WakeWordInvoke(const std::string& wake_word) {
     if (!protocol_) {
         return;
