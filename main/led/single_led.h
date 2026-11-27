@@ -19,6 +19,7 @@ public:
     void SetMicrophoneMuted(bool muted) override;
 
 private:
+    std::mutex state_mutex_;
     std::mutex mutex_;
     TaskHandle_t blink_task_ = nullptr;
     led_strip_handle_t led_strip_ = nullptr;
