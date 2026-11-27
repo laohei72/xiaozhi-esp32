@@ -145,6 +145,9 @@ public:
     void EnableVoiceProcessing(bool enable);
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
+    // Stops the I2S microphone RX path while muted; the audio input task owns codec control.
+    void SetMicrophoneMuted(bool muted);
+    bool IsMicrophoneMuted() const { return microphone_muted_.load(); }
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 
@@ -243,6 +246,7 @@ private:
 #endif
     std::atomic<bool> service_stopped_{true};
     std::atomic<bool> audio_input_need_warmup_{false};
+    std::atomic<bool> microphone_muted_{false};
 
     esp_timer_handle_t audio_power_timer_ = nullptr;
     std::chrono::steady_clock::time_point last_input_time_;
