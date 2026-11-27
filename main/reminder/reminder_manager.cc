@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <cmath>
 
 #include "cjson_utils.h"
 #include "settings.h"
@@ -52,6 +53,7 @@ bool ParseStateName(const char* name, ReminderState& state) {
     else if (std::strcmp(name, "awaiting_response") == 0) state = ReminderState::kAwaitingResponse;
     else if (std::strcmp(name, "completed") == 0) state = ReminderState::kCompleted;
     else if (std::strcmp(name, "cancelled") == 0) state = ReminderState::kCancelled;
+    else if (std::strcmp(name, "paused") == 0) state = ReminderState::kPaused;
     else return false;
     return true;
 }
@@ -84,6 +86,7 @@ const char* ReminderManager::StateName(ReminderState state) {
         case ReminderState::kAwaitingResponse: return "awaiting_response";
         case ReminderState::kCompleted: return "completed";
         case ReminderState::kCancelled: return "cancelled";
+        case ReminderState::kPaused: return "paused";
     }
     return "unknown";
 }
@@ -238,6 +241,10 @@ bool ParseStoredTask(const cJSON* item, ReminderTask& task) {
     task.trigger_ms = static_cast<uint64_t>(JsonNumber(item, "trigger_ms", 0));
     task.trigger_unix = JsonNumber(item, "trigger_unix", 0);
     task.created_ms = static_cast<uint64_t>(JsonNumber(item, "created_ms", 0));
+    const cJSON* stored_retry_count = cJSON_GetObjectItem(item, "retry_count");
+    double retry_count = cJSON_IsNumber(stored_retry_count) ? stored_retry_count->valuedouble : 0.0;
+    if (!std::isfinite(retry_count)) retry_count = 0.0;
+    task.retry_count = static_cast<uint8_t>(std::clamp(retry_count, 0.0, 255.0));
     task.last_fired_unix = JsonNumber(item, "last_fired_unix", 0);
     task.daily_hour = static_cast<int>(JsonNumber(item, "daily_hour", 0));
     task.daily_minute = static_cast<int>(JsonNumber(item, "daily_minute", 0));
@@ -337,6 +344,7 @@ static bool BuildTasksJson(const std::vector<ReminderTask>& tasks, std::string& 
         cJSON_AddNumberToObject(item.get(), "trigger_ms", static_cast<double>(task.trigger_ms));
         cJSON_AddNumberToObject(item.get(), "trigger_unix", static_cast<double>(task.trigger_unix));
         cJSON_AddNumberToObject(item.get(), "created_ms", static_cast<double>(task.created_ms));
+        cJSON_AddNumberToObject(item.get(), "retry_count", task.retry_count);
         cJSON_AddNumberToObject(item.get(), "last_fired_unix",
                                 static_cast<double>(task.last_fired_unix));
         cJSON_AddNumberToObject(item.get(), "daily_hour", task.daily_hour);
@@ -644,6 +652,10 @@ size_t ReminderManager::MarkDueTasks() {
 
 bool ReminderManager::TakeNextDueTask(ReminderTask& out) {
     std::lock_guard<std::mutex> lock(mutex_);
+    // An unresolved reminder owns the response channel; never start another reminder beside it.
+    for (const auto& task : tasks_) {
+        if (task.state == ReminderState::kAwaitingResponse) return false;
+    }
     const uint64_t now_ms = NowMonotonicMs();
     const ReminderTask* next = nullptr;
     for (const auto& task : tasks_) {
@@ -732,32 +744,38 @@ bool ReminderManager::GetAwaitingResponseTask(ReminderTask& out) const {
     return false;
 }
 
-bool ReminderManager::ResolveAwaitingResponse(bool completed, uint64_t delay_ms,
-                                              std::string& out_error) {
+bool ReminderManager::ResolveReminderResponse(uint32_t id, bool completed, uint64_t delay_ms,
+                                                std::string& out_error) {
     std::lock_guard<std::mutex> lock(mutex_);
-    ReminderTask* task = nullptr;
-    for (auto& candidate : tasks_) {
-        if (candidate.state == ReminderState::kAwaitingResponse) {
-            if (task != nullptr) {
-                out_error = "multiple reminders are awaiting a response";
+    ReminderTask* task = FindLocked(id);
+    if (task == nullptr) {
+        out_error = "reminder id not found";
+        return false;
+    }
+    if (task->state != ReminderState::kAwaitingResponse &&
+        task->state != ReminderState::kPaused) {
+        out_error = "reminder is not awaiting a response or paused";
+        return false;
+    }
+    if (task->state == ReminderState::kAwaitingResponse) {
+        for (const auto& candidate : tasks_) {
+            if (candidate.id != id && candidate.state == ReminderState::kAwaitingResponse) {
+                out_error = "another reminder currently owns the response channel";
                 return false;
             }
-            task = &candidate;
         }
-    }
-    if (task == nullptr) {
-        out_error = "there is no reminder awaiting a response";
-        return false;
     }
 
     if (!completed) {
-        if (delay_ms == 0 || delay_ms > UINT64_MAX - NowMonotonicMs()) {
+        const uint64_t now = NowMonotonicMs();
+        if (delay_ms == 0 || delay_ms > UINT64_MAX - now) {
             out_error = "invalid snooze delay";
             return false;
         }
         task->state = ReminderState::kDue;
-        task->retry_not_before_ms = NowMonotonicMs() + delay_ms;
-        ESP_LOGI(TAG, "Reminder %u snoozed", task->id);
+        task->retry_not_before_ms = now + delay_ms;
+        task->retry_count = 0;
+        ESP_LOGI(TAG, "Reminder %u snoozed by user", task->id);
     } else if (IsRecurring(task->type)) {
         const int64_t after = std::max(task->last_fired_unix, NowUnixSeconds());
         const int64_t next = ComputeNextTrigger(*task, after);
@@ -768,10 +786,13 @@ bool ReminderManager::ResolveAwaitingResponse(bool completed, uint64_t delay_ms,
         task->trigger_unix = next;
         task->state = ReminderState::kPending;
         task->recurring_active = true;
+        task->retry_count = 0;
+        task->retry_not_before_ms = 0;
         ESP_LOGI(TAG, "Reminder %u confirmed; next recurring run scheduled", task->id);
     } else {
         task->state = ReminderState::kCompleted;
         task->recurring_active = false;
+        task->retry_count = 0;
         task->retry_not_before_ms = 0;
         ESP_LOGI(TAG, "Reminder %u explicitly completed", task->id);
     }
@@ -784,12 +805,34 @@ bool ReminderManager::RetryAwaitingResponse(uint32_t id, uint64_t delay_ms) {
     std::lock_guard<std::mutex> lock(mutex_);
     ReminderTask* task = FindLocked(id);
     if (task == nullptr || task->state != ReminderState::kAwaitingResponse) return false;
+    if (task->retry_count >= 2) {
+        task->state = ReminderState::kPaused;
+        task->retry_not_before_ms = 0;
+        SaveLocked();
+        ESP_LOGW(TAG, "Reminder %u paused after two automatic retries", id);
+        return false;
+    }
+    const uint64_t now = NowMonotonicMs();
+    if (delay_ms > UINT64_MAX - now) return false;
+    ++task->retry_count;
+    task->state = ReminderState::kDue;
+    task->retry_not_before_ms = now + delay_ms;
+    SaveLocked();
+    ESP_LOGI(TAG, "Reminder %u response timed out; retry %u scheduled", id,
+             static_cast<unsigned>(task->retry_count));
+    return true;
+}
+
+bool ReminderManager::DeferAwaitingResponse(uint32_t id, uint64_t delay_ms) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ReminderTask* task = FindLocked(id);
+    if (task == nullptr || task->state != ReminderState::kAwaitingResponse) return false;
     const uint64_t now = NowMonotonicMs();
     if (delay_ms > UINT64_MAX - now) return false;
     task->state = ReminderState::kDue;
     task->retry_not_before_ms = now + delay_ms;
     SaveLocked();
-    ESP_LOGI(TAG, "Reminder %u response timed out; retry scheduled", id);
+    ESP_LOGW(TAG, "Reminder %u deferred after response-listening failure", id);
     return true;
 }
 
