@@ -783,36 +783,3 @@ bool ReminderManager::RetryAwaitingResponse(uint32_t id, uint64_t delay_ms) {
     return true;
 }
 
-            const int64_t after =
-                task->last_fired_unix > 0 ? task->last_fired_unix : NowUnixSeconds();
-            const int64_t next = ComputeNextTrigger(*task, after);
-            if (next > 0) {
-                task->trigger_unix = next;
-                task->state = ReminderState::kPending;
-                task->recurring_active = true;
-                ESP_LOGI(TAG, "Reminder %u played, next run scheduled", id);
-            } else {
-                task->state = ReminderState::kCompleted;
-                task->recurring_active = false;
-                ESP_LOGE(TAG, "Reminder %u has no future occurrence, marking it completed", id);
-            }
-        } else {
-            task->state = ReminderState::kCompleted;
-            task->recurring_active = false;
-            ESP_LOGI(TAG, "Reminder %u completed", id);
-        }
-    } else if (error == PcmTtsPlayer::Error::kCancelled) {
-        if (IsRecurring(task->type)) {
-            task->state = ReminderState::kPending;
-            task->recurring_active = true;
-        } else {
-            task->state = ReminderState::kDue;
-        }
-        ESP_LOGW(TAG, "Reminder %u was interrupted before it finished, it stays active", id);
-    } else {
-        task->state = ReminderState::kDue;
-        ESP_LOGW(TAG, "Reminder %u playback failed (%s), it stays due", id,
-                 PcmTtsPlayer::GetErrorName(error));
-    }
-    SaveLocked();
-}
